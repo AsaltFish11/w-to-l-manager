@@ -1,0 +1,29 @@
+{
+    "lists" : [
+        {
+            "id": "ChenPi11_cmd",
+            "describe": "Windows cmd.exe 命令解释器在 Unix 上的忠实重实现。\n诞生于 GNU/Linux，可在所有的类 Unix 系统上运行。\n很遗憾，它不支持 Windows 平台，无法占领 Windows 市场。",
+            "github-url": "https://github.com/ChenPi11/cmd",
+            "clone-command": "git clone https://github.com/ChenPi11/cmd.git",
+            "dependency": [
+                "make"
+            ],
+            "install-commands": [
+                {
+                    "permission": "normal",
+                    "command": "make"
+                },
+                {
+                    "permission": "root",
+                    "command": "make install PREFIX=/usr/local"
+                }
+            ],
+            "uninstall-commands": [
+                {
+                    "permission": "root",
+                    "command": "rm -f /usr/local/bin/cmd.exe /usr/local/bin/COMMAND.COM /usr/local/bin/cmd"
+                }
+            ]
+        }
+    ]
+}

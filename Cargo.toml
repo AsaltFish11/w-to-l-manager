@@ -1,0 +1,22 @@
+[package]
+name = "w-to-l-manager"
+version = "0.1.0"
+edition = "2024"
+description = "Windows 移植 Linux 管理器 —— 读取 project_list.json 并管理移植软件的安装与卸载"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 2

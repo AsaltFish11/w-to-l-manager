@@ -1,0 +1,6 @@
+/target
+
+# 状态文件与日志回退到项目目录时会生成这些文件
+/.w2l-manager-state.json
+/.w2l-manager.log
+/.w2l-manager.log.1
