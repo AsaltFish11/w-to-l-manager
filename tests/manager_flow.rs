@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use w_to_l_manager::deps::{self, PackageManagerKind};
 use w_to_l_manager::exec::{Console, Job, JobKind, JobOutcome, JobRequest, JobStep, StepStatus};
 use w_to_l_manager::model::{
-    self, CommandSpec, Permission, ProjectEntry, UninstallOrigin, UninstallSupport,
+    self, CommandSpec, Permission, ProjectEntry, UninstallSupport,
 };
 use w_to_l_manager::paths;
 use w_to_l_manager::source::{self, CloneState};
@@ -67,6 +67,7 @@ fn run_plan(project_id: &str, kind: JobKind, plan: PlannedJob, work_dir: &Path) 
         work_dir: work_dir.to_path_buf(),
         sudo_password: None,
         source_base: plan.source_base,
+        env: Vec::new(),
         console: console.clone(),
     });
     let outcome = wait_for_outcome(&job, Duration::from_secs(30));
@@ -191,7 +192,6 @@ fn full_install_and_uninstall_cycle_with_clone() {
         UninstallSupport::Available(plan) => plan,
         other => panic!("应有卸载计划，实际 {other:?}"),
     };
-    assert_eq!(uninstall.origin, UninstallOrigin::Author);
     let planned = steps::uninstall_steps(&root, entry, &uninstall.commands, &[], None, false);
     run_plan(&entry.id, JobKind::Uninstall, planned, &root);
     assert!(!pwd_file.exists(), "卸载命令应删除 pwd.txt");
@@ -336,6 +336,7 @@ fn failed_dependency_install_aborts_the_project_install() {
         work_dir: dir.clone(),
         sudo_password: None,
         source_base: None,
+        env: Vec::new(),
         console: console.clone(),
     });
 
@@ -442,7 +443,6 @@ fn author_provided_uninstall_commands_take_priority() {
         UninstallSupport::Available(plan) => plan,
         other => panic!("应有卸载计划，实际 {other:?}"),
     };
-    assert_eq!(plan.origin, UninstallOrigin::Author);
     assert_eq!(plan.commands, entry.uninstall_commands);
 
     let planned = steps::install_steps(&root, entry, &[], None, CloneState::Existing);
@@ -472,6 +472,7 @@ fn a_failing_command_stops_the_install_and_is_reported() {
         work_dir: dir.clone(),
         sudo_password: None,
         source_base: None,
+        env: Vec::new(),
         console: console.clone(),
     });
 
@@ -513,6 +514,7 @@ fn wrong_sudo_password_fails_without_hanging() {
         work_dir: dir.clone(),
         sudo_password: Some("definitely-not-the-right-password".to_string()),
         source_base: None,
+        env: Vec::new(),
         console: console.clone(),
     });
 
@@ -598,10 +600,11 @@ fn the_projects_own_project_list_is_valid_and_actionable() {
     }
 }
 
+/// 卸载只执行作者写好的命令：不再从 install-commands 反推。
 #[test]
-fn uninstall_derivation_still_works_and_keeps_permission() {
+fn uninstall_requires_author_provided_commands() {
     let entry = ProjectEntry {
-        id: "derived".to_string(),
+        id: "no-uninstall".to_string(),
         install_commands: vec![
             CommandSpec::normal("./configure"),
             CommandSpec::new("make install PREFIX=/usr/local", Permission::Root),
@@ -610,19 +613,159 @@ fn uninstall_derivation_still_works_and_keeps_permission() {
     };
 
     match model::uninstall_plan(&entry) {
-        UninstallSupport::Available(plan) => {
-            assert_eq!(plan.origin, UninstallOrigin::Derived);
-            assert_eq!(plan.commands.len(), 1);
-            assert_eq!(
-                plan.commands[0].command(),
-                "make uninstall PREFIX=/usr/local"
-            );
-            // 权限沿用原命令
-            assert_eq!(plan.commands[0].permission(), Permission::Root);
-            assert_eq!(plan.skipped, vec!["./configure"]);
+        UninstallSupport::Unavailable { reason } => {
+            assert!(reason.contains("uninstall-commands"), "{reason}");
         }
-        other => panic!("应能推导，实际 {other:?}"),
+        other => panic!("没有 uninstall-commands 就不该能卸载，实际是 {other:?}"),
     }
+
+    // 写了就能卸载，权限照搬
+    let with_uninstall = ProjectEntry {
+        uninstall_commands: vec![CommandSpec::new("make uninstall", Permission::Root)],
+        ..entry
+    };
+    match model::uninstall_plan(&with_uninstall) {
+        UninstallSupport::Available(plan) => {
+            assert_eq!(plan.commands.len(), 1);
+            assert_eq!(plan.commands[0].command(), "make uninstall");
+            assert_eq!(plan.commands[0].permission(), Permission::Root);
+        }
+        other => panic!("应该可以卸载，实际是 {other:?}"),
+    }
+}
+
+/// 更新流程的「取文件 + 清理」部分不需要联网，单独跑一遍验证。
+#[test]
+fn update_extracts_the_list_and_cleans_up_the_tmp_dir() {
+    let root = temp_dir("update-extract");
+    let clone = steps::clone_dir(&root);
+
+    // 模拟“配置仓库已经克隆到临时目录”
+    fs::create_dir_all(&clone).unwrap();
+    fs::write(
+        clone.join(steps::CONFIG_LIST_FILE),
+        r#"{"lists":[{"id":"brand-new","install-commands":["true"]}]}"#,
+    )
+    .unwrap();
+    // 项目根下先放一份旧的，它必须被新的覆盖掉
+    fs::write(
+        root.join(paths::PROJECT_LIST_FILE),
+        r#"{"lists":[{"id":"OLD"}]}"#,
+    )
+    .unwrap();
+
+    // 只跑后三步（拷贝 → 改名 → 清理），跳过 rm/mkdir/clone 这些联网步骤
+    let steps_to_run: Vec<_> = steps::update_steps(&root).into_iter().skip(3).collect();
+    assert_eq!(steps_to_run.len(), 3, "应该是 拷贝 / 改名 / 清理 三步");
+
+    let console = Console::new(false);
+    let job = Job::spawn(JobRequest {
+        project_id: steps::CONFIG_DIR_NAME.to_string(),
+        kind: JobKind::Update,
+        steps: steps_to_run,
+        work_dir: root.clone(),
+        sudo_password: None,
+        source_base: None,
+        env: Vec::new(),
+        console: console.clone(),
+    });
+    assert_eq!(
+        wait_for_outcome(&job, Duration::from_secs(20)),
+        JobOutcome::Succeeded,
+        "{}\n{}",
+        job.lock().message,
+        console_text(&console)
+    );
+
+    // 项目根目录下的列表被换成了最新的
+    let text = fs::read_to_string(root.join(paths::PROJECT_LIST_FILE)).unwrap();
+    let loaded = model::parse(&text).unwrap();
+    assert_eq!(loaded.entries[0].id, "brand-new");
+
+    // 临时目录和中间文件都不该留下
+    assert!(!clone.exists(), "克隆目录应被删除");
+    assert!(!steps::tmp_dir(&root).exists(), "tmp 空了就应该被删掉");
+    assert!(!root.join(".project_list.json.new").exists(), "中间文件应被改名走");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// 临时目录里还有别的东西时，只删我们自己的克隆，不动别人的内容。
+#[test]
+fn update_keeps_unrelated_files_in_the_tmp_dir() {
+    let root = temp_dir("update-keep");
+    let clone = steps::clone_dir(&root);
+    fs::create_dir_all(&clone).unwrap();
+    fs::write(
+        clone.join(steps::CONFIG_LIST_FILE),
+        r#"{"lists":[{"id":"new","install-commands":["true"]}]}"#,
+    )
+    .unwrap();
+    // ./tmp 里放一份“别人的”文件
+    fs::write(steps::tmp_dir(&root).join("keep-me.txt"), "hello").unwrap();
+
+    let steps_to_run: Vec<_> = steps::update_steps(&root).into_iter().skip(3).collect();
+    let console = Console::new(false);
+    let job = Job::spawn(JobRequest {
+        project_id: steps::CONFIG_DIR_NAME.to_string(),
+        kind: JobKind::Update,
+        steps: steps_to_run,
+        work_dir: root.clone(),
+        sudo_password: None,
+        source_base: None,
+        env: Vec::new(),
+        console: console.clone(),
+    });
+    assert_eq!(
+        wait_for_outcome(&job, Duration::from_secs(20)),
+        JobOutcome::Succeeded,
+        "{}",
+        console_text(&console)
+    );
+
+    assert!(!clone.exists(), "我们自己的克隆目录应被删除");
+    assert!(
+        steps::tmp_dir(&root).join("keep-me.txt").is_file(),
+        "tmp 里别人的文件不该被动"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// 设置里配的环境变量要真的出现在每条命令的环境里（值里有空格也要正确引用）。
+#[test]
+fn configured_environment_variables_reach_every_command() {
+    let dir = temp_dir("env");
+    let console = Console::new(false);
+
+    let job = Job::spawn(JobRequest {
+        project_id: "env-test".to_string(),
+        kind: JobKind::Install,
+        steps: vec![
+            JobStep::user("echo \"GREETING=$W2L_GREETING\""),
+            JobStep::user("echo \"SECOND=$W2L_SECOND\""),
+        ],
+        work_dir: dir.clone(),
+        sudo_password: None,
+        source_base: None,
+        env: vec![
+            ("W2L_GREETING".to_string(), "hello world".to_string()),
+            ("W2L_SECOND".to_string(), "it's fine".to_string()),
+        ],
+        console: console.clone(),
+    });
+
+    assert_eq!(
+        wait_for_outcome(&job, Duration::from_secs(20)),
+        JobOutcome::Succeeded,
+        "{}",
+        console_text(&console)
+    );
+    let text = console_text(&console);
+    assert!(text.contains("GREETING=hello world"), "带空格的值应被正确引用：\n{text}");
+    assert!(text.contains("SECOND=it's fine"), "含单引号的值也要正确：\n{text}");
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -6,13 +6,13 @@
 //! 避免把密码喂给被测程序的标准输入。
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::paths;
 use crate::state::now_secs;
@@ -20,11 +20,16 @@ use crate::state::now_secs;
 /// 日志保留的最大行数，超出后丢弃最旧的行。
 pub const MAX_LOG_LINES: usize = 50_000;
 
+/// 长时间运行的命令每隔这么久报一次「还在跑」，方便区分「慢」和「卡死」。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
 /// 一次操作是安装还是卸载。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
     Install,
     Uninstall,
+    /// 拉取最新的 project_list.json（克隆配置仓库）。
+    Update,
 }
 
 impl JobKind {
@@ -32,6 +37,7 @@ impl JobKind {
         match self {
             JobKind::Install => "安装",
             JobKind::Uninstall => "卸载",
+            JobKind::Update => "更新列表",
         }
     }
 
@@ -40,6 +46,7 @@ impl JobKind {
         match self {
             JobKind::Install => "正在安装",
             JobKind::Uninstall => "正在卸载",
+            JobKind::Update => "正在更新列表",
         }
     }
 
@@ -47,6 +54,7 @@ impl JobKind {
         match self {
             JobKind::Install => "安装",
             JobKind::Uninstall => "卸载",
+            JobKind::Update => "更新列表",
         }
     }
 }
@@ -349,6 +357,8 @@ pub struct JobRequest {
     pub sudo_password: Option<String>,
     /// 项目源码目录（`<项目根>/sources/<id>`），用于解析 [`WorkDir::ProjectSource`]。
     pub source_base: Option<PathBuf>,
+    /// 每条命令执行前先导出的环境变量（在设置页面里配置）。
+    pub env: Vec<(String, String)>,
     pub console: Console,
 }
 
@@ -401,6 +411,7 @@ impl Job {
             steps: req.steps,
             work_dir: req.work_dir,
             source_base: req.source_base,
+            env: req.env,
             console: req.console,
         };
         thread::spawn(move || worker.run());
@@ -495,12 +506,15 @@ struct Worker {
     steps: Vec<JobStep>,
     work_dir: PathBuf,
     source_base: Option<PathBuf>,
+    env: Vec<(String, String)>,
     console: Console,
 }
 
 impl Worker {
     fn run(self) {
+        let job_started = Instant::now();
         let result = self.run_steps();
+        let total_secs = job_started.elapsed().as_secs_f32();
         let (outcome, message) = match result {
             Ok(()) => (JobOutcome::Succeeded, String::new()),
             Err(StepError::Cancelled) => (JobOutcome::Cancelled, "已取消".to_string()),
@@ -526,14 +540,28 @@ impl Worker {
             )
         };
 
+        log::info!(
+            "任务 #{} 结束：{outcome:?}（总耗时 {total_secs:.1} 秒）",
+            self.lock().id
+        );
+
         let (stream, text) = match outcome {
             JobOutcome::Succeeded if ignored > 0 => (
                 LogStream::Info,
-                format!("✔ 命令执行完成（有 {ignored} 步失败但已忽略）"),
+                format!("✔ 命令执行完成（有 {ignored} 步失败但已忽略，总耗时 {total_secs:.1} 秒）"),
             ),
-            JobOutcome::Succeeded => (LogStream::Info, "✔ 全部命令执行成功".to_string()),
-            JobOutcome::Cancelled => (LogStream::Info, "■ 任务已取消".to_string()),
-            _ => (LogStream::Info, format!("✖ 任务失败：{message}")),
+            JobOutcome::Succeeded => (
+                LogStream::Info,
+                format!("✔ 全部命令执行成功（总耗时 {total_secs:.1} 秒）"),
+            ),
+            JobOutcome::Cancelled => (
+                LogStream::Info,
+                format!("■ 任务已取消（已运行 {total_secs:.1} 秒）"),
+            ),
+            _ => (
+                LogStream::Info,
+                format!("✖ 任务失败（已运行 {total_secs:.1} 秒）：{message}"),
+            ),
         };
         self.console.push(LogLine {
             job_id: id,
@@ -565,6 +593,15 @@ impl Worker {
     fn run_steps(&self) -> Result<(), StepError> {
         if self.steps.is_empty() {
             return Err(StepError::Message("没有可执行的命令".to_string()));
+        }
+
+        if !self.env.is_empty() {
+            let shown: Vec<String> = self
+                .env
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
+            log::info!("本任务会先导出环境变量：{}", shown.join(" "));
         }
 
         let already_root = running_as_root();
@@ -611,7 +648,9 @@ impl Worker {
             let prefix = if step.needs_root { "$ (root) " } else { "$ " };
             self.log(index, LogStream::Info, format!("{prefix}{}", step.command));
 
+            let step_started = Instant::now();
             let code = self.exec_one(index, step, &dir, sudo_password.as_deref())?;
+            let step_secs = step_started.elapsed().as_secs_f32();
 
             {
                 let mut guard = self.lock();
@@ -622,7 +661,19 @@ impl Worker {
                 };
             }
             if code == 0 {
-                log::info!("步骤 {}/{} 完成", index + 1, self.steps.len());
+                log::info!(
+                    "步骤 {}/{} 完成（耗时 {step_secs:.1} 秒）",
+                    index + 1,
+                    self.steps.len()
+                );
+                // 慢命令（比如国内克隆仓库）把耗时也显示出来，便于判断是否正常
+                if step_secs >= 1.0 {
+                    self.log(
+                        index,
+                        LogStream::Info,
+                        format!("✔ 完成（耗时 {step_secs:.1} 秒）"),
+                    );
+                }
             }
             if code != 0 {
                 let shown = if code < 0 {
@@ -822,11 +873,15 @@ impl Worker {
         //
         // 前缀 `exec 0</dev/null` 是为了把命令的 stdin 切断：
         // 万一 sudo 用了缓存没读走密码，残留的那一行也不会被命令读到。
-        let script = if use_sudo {
-            format!("exec 0</dev/null; {}", job_step.command)
-        } else {
-            job_step.command.clone()
-        };
+        let mut script = String::new();
+        // 先导出用户在设置里配置的环境变量
+        if !self.env.is_empty() {
+            script.push_str(&env_prefix(&self.env));
+        }
+        if use_sudo {
+            script.push_str("exec 0</dev/null; ");
+        }
+        script.push_str(&job_step.command);
 
         let mut command = if use_sudo {
             let mut c = Command::new("sudo");
@@ -895,7 +950,30 @@ impl Worker {
         });
 
         // 不持任何锁地等待子进程退出；读取管道的线程仍在并行排空输出。
-        let status = child.wait();
+        //
+        // 用 try_wait 轮询而不是直接 wait：这样每 10 秒能报一次「还在跑」，
+        // 国内克隆仓库要几分钟，没有心跳根本分不清是慢还是卡死。
+        let started = Instant::now();
+        let mut last_heartbeat = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                        last_heartbeat = Instant::now();
+                        let secs = started.elapsed().as_secs();
+                        log::info!("步骤 {} 仍在执行（已耗时 {secs} 秒）", step + 1);
+                        self.log(
+                            step,
+                            LogStream::Info,
+                            format!("⏳ 仍在执行… 已耗时 {secs} 秒"),
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                Err(err) => break Err(err),
+            }
+        };
         self.pid.store(0, Ordering::SeqCst);
 
         if let Some(handle) = out_handle {
@@ -919,6 +997,22 @@ enum StepError {
     Message(String),
 }
 
+/// 把环境变量拼成 shell 前缀：`export KEY='VALUE'; ...`。
+///
+/// 用 shell 前缀而不是 `Command::env`，是因为 root 命令要经过 `sudo`，
+/// 而 `sudo` 默认会重置环境变量，直接传环境就丢了。
+fn env_prefix(env: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (key, value) in env {
+        out.push_str("export ");
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&crate::model::shell_quote(value));
+        out.push_str("; ");
+    }
+    out
+}
+
 /// sudo 认证类错误：说明存下来的密码不可用，应当让用户重新输入。
 pub fn looks_like_auth_failure(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
@@ -936,7 +1030,44 @@ pub fn looks_like_auth_failure(text: &str) -> bool {
     .any(|pattern| lowered.contains(pattern))
 }
 
+/// 把一段字节推到控制台（顺带写日志、识别 sudo 认证错误）。
+#[allow(clippy::too_many_arguments)]
+fn push_output(
+    console: &Console,
+    job_id: u64,
+    project_id: &str,
+    step: usize,
+    stream: LogStream,
+    auth_failed: &Option<Arc<AtomicBool>>,
+    bytes: &[u8],
+) {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    if text.is_empty() {
+        return;
+    }
+    match stream {
+        LogStream::Stderr => log::debug!("[stderr] {text}"),
+        _ => log::debug!("[stdout] {text}"),
+    }
+    if let Some(flag) = auth_failed
+        && looks_like_auth_failure(&text)
+    {
+        flag.store(true, Ordering::SeqCst);
+    }
+    console.push(LogLine {
+        job_id,
+        project_id: project_id.to_string(),
+        step,
+        stream,
+        text,
+    });
+}
+
 /// 把一个管道的内容按行推入控制台。
+///
+/// `\r` 也当作换行处理：`git clone --progress`、各种下载进度条是用 `\r`
+/// 原地刷新的（后面并不跟换行），只按 `\n` 切分的话，这些进度会一直攒在
+/// 缓冲区里，直到命令结束才一次性冒出来 —— 慢速克隆时看起来就像“卡死了”。
 #[allow(clippy::too_many_arguments)]
 fn pump<R: Read + Send + 'static>(
     reader: R,
@@ -949,35 +1080,46 @@ fn pump<R: Read + Send + 'static>(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
-        let mut buffer = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+
         loop {
-            buffer.clear();
-            match reader.read_until(b'\n', &mut buffer) {
+            match reader.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(_) => {
-                    while matches!(buffer.last(), Some(b'\n') | Some(b'\r')) {
-                        buffer.pop();
+                Ok(n) => {
+                    for &byte in &chunk[..n] {
+                        if byte == b'\n' || byte == b'\r' {
+                            if !pending.is_empty() {
+                                push_output(
+                                    &console,
+                                    job_id,
+                                    &project_id,
+                                    step,
+                                    stream,
+                                    &auth_failed,
+                                    &pending,
+                                );
+                                pending.clear();
+                            }
+                        } else {
+                            pending.push(byte);
+                        }
                     }
-                    let text = String::from_utf8_lossy(&buffer).into_owned();
-                    match stream {
-                        LogStream::Stderr => log::debug!("[stderr] {text}"),
-                        _ => log::debug!("[stdout] {text}"),
-                    }
-                    if let Some(flag) = &auth_failed
-                        && looks_like_auth_failure(&text)
-                    {
-                        flag.store(true, Ordering::SeqCst);
-                    }
-                    console.push(LogLine {
-                        job_id,
-                        project_id: project_id.clone(),
-                        step,
-                        stream,
-                        text,
-                    });
                 }
                 Err(_) => break,
             }
+        }
+
+        if !pending.is_empty() {
+            push_output(
+                &console,
+                job_id,
+                &project_id,
+                step,
+                stream,
+                &auth_failed,
+                &pending,
+            );
         }
     })
 }
@@ -1064,6 +1206,7 @@ mod tests {
                 work_dir: std::env::temp_dir(),
                 sudo_password: None,
                 source_base: None,
+                env: Vec::new(),
                 console: console.clone(),
             },
             console,
@@ -1134,6 +1277,7 @@ mod tests {
                 work_dir: std::env::temp_dir(),
                 sudo_password: None,
                 source_base: None,
+                env: Vec::new(),
                 console: console.clone(),
             });
             assert!(wait_for(&job, word, Duration::from_secs(20)));
@@ -1168,6 +1312,7 @@ mod tests {
             work_dir: std::env::temp_dir(),
             sudo_password: None,
             source_base: None,
+            env: Vec::new(),
             console: console.clone(),
         });
 
@@ -1229,6 +1374,7 @@ mod tests {
             // 没有缓存密码 → 执行到这一步时应该来问
             sudo_password: None,
             source_base: None,
+            env: Vec::new(),
             console: console.clone(),
         });
 
@@ -1262,6 +1408,7 @@ mod tests {
             work_dir: std::env::temp_dir(),
             sudo_password: None,
             source_base: None,
+            env: Vec::new(),
             console: console.clone(),
         });
         assert!(wait_for(&job, "普通步骤", Duration::from_secs(20)));
@@ -1293,6 +1440,7 @@ mod tests {
             work_dir: std::env::temp_dir(),
             sudo_password: None,
             source_base: Some(base.clone()),
+            env: Vec::new(),
             console: console.clone(),
         });
         assert!(wait_for(&job, "源码目录解析", Duration::from_secs(20)));
@@ -1313,6 +1461,22 @@ mod tests {
         assert!(console_text(&console).iter().any(|l| l == "cloned"));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn env_prefix_quotes_values() {
+        let prefix = env_prefix(&[
+            ("PLAIN".to_string(), "abc".to_string()),
+            ("SPACED".to_string(), "x y".to_string()),
+            ("QUOTED".to_string(), "it's".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ]);
+        assert_eq!(
+            prefix,
+            "export PLAIN=abc; export SPACED='x y'; export QUOTED='it'\\''s'; export EMPTY=''; "
+        );
+
+        assert_eq!(env_prefix(&[]), "");
     }
 
     #[test]
@@ -1354,6 +1518,7 @@ mod tests {
             work_dir: std::env::temp_dir(),
             sudo_password: None,
             source_base: None,
+            env: Vec::new(),
             console: console.clone(),
         });
 

@@ -279,34 +279,13 @@ pub fn parse(text: &str) -> Result<LoadedList, String> {
 }
 
 // ---------------------------------------------------------------------------
-// 卸载命令推导
+// 卸载计划
 // ---------------------------------------------------------------------------
 
-/// 卸载命令的来源。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UninstallOrigin {
-    /// 由 `project_list.json` 的作者显式提供。
-    Author,
-    /// 从 `install-commands` 自动推导而来，执行前应提示用户。
-    Derived,
-}
-
-impl UninstallOrigin {
-    pub fn label(self) -> &'static str {
-        match self {
-            UninstallOrigin::Author => "JSON 提供",
-            UninstallOrigin::Derived => "自动推导",
-        }
-    }
-}
-
-/// 可执行的卸载计划。
+/// 卸载计划：直接采用作者在 `uninstall-commands` 里写的命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UninstallPlan {
     pub commands: Vec<CommandSpec>,
-    pub origin: UninstallOrigin,
-    /// 无法推导出卸载命令的安装命令（仅 `Derived` 时可能非空）。
-    pub skipped: Vec<String>,
 }
 
 /// 某个条目能否卸载。
@@ -316,305 +295,25 @@ pub enum UninstallSupport {
     Unavailable { reason: String },
 }
 
-/// 计算某个条目的卸载计划：优先使用 JSON 中的 `uninstall-commands`，
-/// 否则从 `install-commands` 推导。
+/// 某条目是否可以卸载。
+///
+/// 只认作者显式写在 `uninstall-commands` 里的命令：从 `install-commands`
+/// 反推卸载命令并不可靠（`make install` 未必有对应的 `make uninstall`，
+/// 改写出来的命令有可能删错东西），所以不做任何推导。
 pub fn uninstall_plan(entry: &ProjectEntry) -> UninstallSupport {
-    if !entry.uninstall_commands.is_empty() {
-        return UninstallSupport::Available(UninstallPlan {
-            commands: entry.uninstall_commands.clone(),
-            origin: UninstallOrigin::Author,
-            skipped: Vec::new(),
-        });
-    }
-
-    let mut commands = Vec::new();
-    let mut skipped = Vec::new();
-    for spec in &entry.install_commands {
-        match derive_uninstall(spec.command()) {
-            // 推导出来的命令沿用原来的权限声明
-            Some(derived) => commands.push(spec.with_command(derived)),
-            None => skipped.push(spec.command().to_string()),
-        }
-    }
-
-    if commands.is_empty() {
-        let reason = if entry.install_commands.is_empty() {
-            "该条目没有 install-commands，也没有 uninstall-commands".to_string()
-        } else {
-            "无法从 install-commands 推导出卸载命令，请在 project_list.json 中补充 uninstall-commands"
-                .to_string()
+    if entry.uninstall_commands.is_empty() {
+        return UninstallSupport::Unavailable {
+            reason: "该条目没有提供 uninstall-commands，请在 project_list.json 里补充".to_string(),
         };
-        return UninstallSupport::Unavailable { reason };
     }
-
     UninstallSupport::Available(UninstallPlan {
-        commands,
-        origin: UninstallOrigin::Derived,
-        skipped,
+        commands: entry.uninstall_commands.clone(),
     })
 }
 
-/// 把一条安装命令改写为对应的卸载命令；无法可靠推导时返回 `None`。
-pub fn derive_uninstall(install_command: &str) -> Option<String> {
-    let words = split_words(install_command)?;
-    if words.is_empty() {
-        return None;
-    }
-
-    // 跳过 sudo/doas/env 以及 VAR=VAL 前缀，定位真正的程序名。
-    let mut pi = 0;
-    while pi < words.len() {
-        let w = &words[pi];
-        if w == "sudo" || w == "doas" || w == "env" || is_env_assignment(w) {
-            pi += 1;
-        } else {
-            break;
-        }
-    }
-    let program = words.get(pi)?;
-    let base = basename(program);
-
-    match base {
-        // make / ninja 系列：把 install 目标换成 uninstall。
-        "make" | "gmake" | "bmake" | "ninja" | "ninja-build" => {
-            let mut out = words.clone();
-            let pos = out
-                .iter()
-                .position(|w| w == "install" || w == "install-strip")?;
-            out[pos] = "uninstall".to_string();
-            Some(join_words(&out))
-        }
-
-        // cargo install NAME -> cargo uninstall NAME
-        "cargo" => {
-            if words.get(pi + 1).map(String::as_str) != Some("install") {
-                return None;
-            }
-            let name = collect_packages(&words, pi + 2, CARGO_VALUE_FLAGS, &[])?;
-            Some(format!("cargo uninstall {}", join_words(&name)))
-        }
-
-        // pip install A B -> pip uninstall -y A B
-        "pip" | "pip3" | "pip3.12" => {
-            if words.get(pi + 1).map(String::as_str) != Some("install") {
-                return None;
-            }
-            let pkgs = collect_packages(&words, pi + 2, PIP_VALUE_FLAGS, &[])?;
-            Some(format!("{program} uninstall -y {}", join_words(&pkgs)))
-        }
-
-        // python -m pip install A -> python -m pip uninstall -y A
-        "python" | "python3" => {
-            if words.get(pi + 1).map(String::as_str) != Some("-m")
-                || words.get(pi + 2).map(String::as_str) != Some("pip")
-                || words.get(pi + 3).map(String::as_str) != Some("install")
-            {
-                return None;
-            }
-            let pkgs = collect_packages(&words, pi + 4, PIP_VALUE_FLAGS, &[])?;
-            Some(format!(
-                "{program} -m pip uninstall -y {}",
-                join_words(&pkgs)
-            ))
-        }
-
-        // npm/pnpm/yarn/bun install [-g] A -> <pm> uninstall [-g] A
-        "npm" | "pnpm" | "yarn" | "bun" => {
-            let sub = words.get(pi + 1).map(String::as_str)?;
-            if !matches!(sub, "install" | "i" | "add" | "global") {
-                return None;
-            }
-            let keep_global = words
-                .iter()
-                .any(|w| w == "-g" || w == "--global" || w == "global");
-            let global = if keep_global { " -g" } else { "" };
-            let pkgs = collect_packages(&words, pi + 2, NPM_VALUE_FLAGS, &["-g", "--global"])?;
-            Some(format!(
-                "{program} uninstall{global} {}",
-                join_words(&pkgs)
-            ))
-        }
-
-        _ => None,
-    }
-}
-
-/// 需要跳过一个后续参数的 cargo 选项（布尔开关不在此列）。
-const CARGO_VALUE_FLAGS: &[&str] = &[
-    "--path",
-    "--git",
-    "--branch",
-    "--tag",
-    "--rev",
-    "--version",
-    "--index",
-    "--registry",
-    "--root",
-    "--target",
-    "--features",
-    "-j",
-    "--jobs",
-    "--profile",
-];
-
-/// 需要跳过一个后续参数的 pip 选项。
-const PIP_VALUE_FLAGS: &[&str] = &[
-    "-r",
-    "--requirement",
-    "-c",
-    "--constraint",
-    "-t",
-    "--target",
-    "-i",
-    "--index-url",
-    "--extra-index-url",
-    "-f",
-    "--find-links",
-    "--trusted-host",
-    "--platform",
-    "--python-version",
-    "--implementation",
-    "--abi",
-    "--cache-dir",
-    "--prefix",
-    "--root",
-    "--src",
-    "--upgrade-strategy",
-    "--no-binary",
-    "--only-binary",
-];
-
-/// 需要跳过一个后续参数的 npm 选项。
-const NPM_VALUE_FLAGS: &[&str] = &[
-    "--prefix",
-    "--registry",
-    "--tag",
-    "--cache",
-    "--omit",
-    "--save-prefix",
-    "--workspace",
-    "-w",
-];
-
-/// 从 `start` 开始收集“包名”类参数，跳过选项与选项的取值。
-/// 收集不到任何包名时返回 `None`。
-fn collect_packages(
-    words: &[String],
-    start: usize,
-    value_flags: &[&str],
-    ignore: &[&str],
-) -> Option<Vec<String>> {
-    let mut out = Vec::new();
-    let mut i = start;
-    while i < words.len() {
-        let w = &words[i];
-        if w == "--" {
-            i += 1;
-            continue;
-        }
-        if ignore.contains(&w.as_str()) {
-            i += 1;
-            continue;
-        }
-        if w.starts_with('-') {
-            // `-j4`、`--path=.` 这类自带取值的写法只占一个词。
-            let takes_value = value_flags.contains(&w.as_str()) && !w.contains('=');
-            i += if takes_value { 2 } else { 1 };
-            continue;
-        }
-        out.push(w.clone());
-        i += 1;
-    }
-    if out.is_empty() { None } else { Some(out) }
-}
-
-fn is_env_assignment(word: &str) -> bool {
-    match word.split_once('=') {
-        Some((name, _)) => {
-            !name.is_empty()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        None => false,
-    }
-}
-
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
 // ---------------------------------------------------------------------------
-// 轻量 shell 分词 / 还原（不执行任何命令，只用于改写与拼接命令行）
+// shell 引用
 // ---------------------------------------------------------------------------
-
-/// 按 shell 规则把一个命令行拆成词；引号不配对时返回 `None`。
-pub fn split_words(input: &str) -> Option<Vec<String>> {
-    let mut words = Vec::new();
-    let mut cur = String::new();
-    let mut started = false;
-    let mut chars = input.chars();
-
-    while let Some(c) = chars.next() {
-        match c {
-            ' ' | '\t' | '\n' | '\r' => {
-                if started {
-                    words.push(std::mem::take(&mut cur));
-                    started = false;
-                }
-            }
-            '\'' => {
-                started = true;
-                loop {
-                    match chars.next() {
-                        Some('\'') => break,
-                        Some(ch) => cur.push(ch),
-                        None => return None,
-                    }
-                }
-            }
-            '"' => {
-                started = true;
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(e @ ('"' | '\\' | '$' | '`')) => cur.push(e),
-                            Some(other) => {
-                                cur.push('\\');
-                                cur.push(other);
-                            }
-                            None => return None,
-                        },
-                        Some(ch) => cur.push(ch),
-                        None => return None,
-                    }
-                }
-            }
-            '\\' => {
-                started = true;
-                cur.push(chars.next()?);
-            }
-            _ => {
-                started = true;
-                cur.push(c);
-            }
-        }
-    }
-    if started {
-        words.push(cur);
-    }
-    Some(words)
-}
-
-/// 把词表还原成命令行，必要时加单引号。
-pub fn join_words(words: &[String]) -> String {
-    words
-        .iter()
-        .map(|w| shell_quote(w))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 /// 把一个字符串安全地放进 shell 命令行（需要时加单引号）。
 pub fn shell_quote(word: &str) -> String {
@@ -815,57 +514,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn derives_make_uninstall_and_keeps_arguments() {
-        assert_eq!(
-            derive_uninstall("make install PREFIX=/usr/local").as_deref(),
-            Some("make uninstall PREFIX=/usr/local")
-        );
-        assert_eq!(
-            derive_uninstall("make install").as_deref(),
-            Some("make uninstall")
-        );
-        assert_eq!(
-            derive_uninstall("sudo make install DESTDIR=/tmp/x").as_deref(),
-            Some("sudo make uninstall DESTDIR=/tmp/x")
-        );
-        assert_eq!(
-            derive_uninstall("ninja -C build install").as_deref(),
-            Some("ninja -C build uninstall")
-        );
-    }
+
+
 
     #[test]
-    fn derives_package_manager_uninstalls() {
-        assert_eq!(
-            derive_uninstall("cargo install --locked ripgrep").as_deref(),
-            Some("cargo uninstall ripgrep")
-        );
-        assert_eq!(
-            derive_uninstall("pip install requests flask").as_deref(),
-            Some("pip uninstall -y requests flask")
-        );
-        assert_eq!(
-            derive_uninstall("python3 -m pip install -r req.txt").as_deref(),
-            None
-        );
-        assert_eq!(
-            derive_uninstall("npm install -g typescript").as_deref(),
-            Some("npm uninstall -g typescript")
-        );
-    }
-
-    #[test]
-    fn refuses_to_guess_when_unsafe() {
-        assert_eq!(derive_uninstall("./install.sh"), None);
-        assert_eq!(derive_uninstall("cp -r ./bin /usr/local/bin"), None);
-        assert_eq!(derive_uninstall("make"), None);
-        assert_eq!(derive_uninstall("rm -rf /"), None);
-        assert_eq!(derive_uninstall(""), None);
-    }
-
-    #[test]
-    fn plans_prefer_author_commands() {
+    fn plan_uses_the_author_provided_commands() {
         let e = entry(
             "a",
             &[CommandSpec::normal("make install")],
@@ -873,60 +526,34 @@ mod tests {
         );
         match uninstall_plan(&e) {
             UninstallSupport::Available(p) => {
-                assert_eq!(p.origin, UninstallOrigin::Author);
+                assert_eq!(p.commands.len(), 1);
                 assert_eq!(p.commands[0].command(), "make uninstall");
                 // 权限声明跟着作者走
                 assert_eq!(p.commands[0].permission(), Permission::Root);
-                assert!(p.skipped.is_empty());
             }
             other => panic!("unexpected {other:?}"),
         }
     }
 
+    /// 没有写 uninstall-commands 就不能卸载 —— 不再从 install-commands 反推。
     #[test]
-    fn plans_record_underivable_commands_and_keep_permission() {
-        let e = entry(
-            "a",
-            &[
-                CommandSpec::normal("./configure"),
-                CommandSpec::new("make install", Permission::Root),
-            ],
-            &[],
-        );
-        match uninstall_plan(&e) {
-            UninstallSupport::Available(p) => {
-                assert_eq!(p.origin, UninstallOrigin::Derived);
-                assert_eq!(p.commands.len(), 1);
-                assert_eq!(p.commands[0].command(), "make uninstall");
-                assert_eq!(p.commands[0].permission(), Permission::Root);
-                assert_eq!(p.skipped, vec!["./configure"]);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plans_report_unavailable() {
-        let e = entry("a", &[CommandSpec::normal("./install.sh")], &[]);
+    fn plan_refuses_to_derive_uninstall_commands() {
+        // 哪怕安装命令看起来“能推导”（make install），也不再猜
+        let e = entry("a", &[CommandSpec::normal("make install")], &[]);
         match uninstall_plan(&e) {
             UninstallSupport::Unavailable { reason } => {
                 assert!(reason.contains("uninstall-commands"), "{reason}")
             }
-            other => panic!("unexpected {other:?}"),
+            other => panic!("不该推导出卸载命令，实际是 {other:?}"),
         }
+
+        // 完全没有命令的条目同样不可卸载
         assert!(matches!(
             uninstall_plan(&entry("b", &[], &[])),
             UninstallSupport::Unavailable { .. }
         ));
     }
 
-    #[test]
-    fn split_and_join_roundtrip_quotes() {
-        let words = split_words(r#"sh -c "echo hi" 'a b' c\ d"#).unwrap();
-        assert_eq!(words, vec!["sh", "-c", "echo hi", "a b", "c d"]);
-        assert_eq!(join_words(&words), "sh -c 'echo hi' 'a b' 'c d'");
-        assert_eq!(split_words("unterminated 'x"), None);
-    }
 
     #[test]
     fn quotes_paths_with_spaces() {

@@ -9,6 +9,7 @@ pub mod exec;
 pub mod fonts;
 pub mod logging;
 pub mod model;
+pub mod open;
 pub mod paths;
 pub mod source;
 pub mod state;

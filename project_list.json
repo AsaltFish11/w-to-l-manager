@@ -1,7 +1,7 @@
 {
     "lists" : [
         {
-            "id": "ChenPi11-cmd",
+            "id": "cmd",
             "author": "ChenPi11",
             "describe": "Windows cmd.exe 命令解释器在 Unix 上的忠实重实现。\n诞生于 GNU/Linux，可在所有的类 Unix 系统上运行。\n很遗憾，它不支持 Windows 平台，无法占领 Windows 市场。",
             "github-url": "https://github.com/ChenPi11/cmd",
@@ -30,7 +30,7 @@
             ]
         },
         {
-            "id": "macOS-Terminal-Explorer-for-Linux",
+            "id": "Explorer-for-Linux",
             "author": "macOS-Terminal",
             "describe": "在 Linux 上深度复刻 Windows 11 资源管理器的极客项目，还原其经典的“未响应”体验。\n注意：本项目包含崩溃接管与强制退出功能。默认配置不会破坏任何东西，但打开 EXPLORER_SESSION_KILL=1 后它会真的终止你的用户会话。只装在你自己的机器上， 装之前备份配置，并背下 Shift+F10。",
             "github-url": "https://github.com/macOS-Terminal/Explorer-for-Linux",

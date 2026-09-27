@@ -8,6 +8,65 @@ use crate::model::{self, CommandSpec, ProjectEntry};
 use crate::paths;
 use crate::source::{self, CloneState};
 
+/// 配置仓库：里面放着最新的 `project_list.json`。
+pub const CONFIG_REPO_URL: &str = "https://github.com/AsaltFish11/w-to-l-manager-config.git";
+/// 克隆出来的仓库目录名。
+pub const CONFIG_DIR_NAME: &str = "w-to-l-manager-config";
+/// 克隆用的临时目录名（位于项目根目录下）。
+pub const TMP_DIR_NAME: &str = "tmp";
+/// 配置仓库里列表文件的名字。
+pub const CONFIG_LIST_FILE: &str = "project_list.json";
+
+/// 克隆用的临时目录：`<项目根>/tmp`
+pub fn tmp_dir(project_root: &Path) -> PathBuf {
+    project_root.join(TMP_DIR_NAME)
+}
+
+/// 配置仓库被克隆到哪里：`<项目根>/tmp/w-to-l-manager-config`
+pub fn clone_dir(project_root: &Path) -> PathBuf {
+    tmp_dir(project_root).join(CONFIG_DIR_NAME)
+}
+
+/// 组装「更新列表」的步骤。
+///
+/// 流程：克隆到临时目录 → 把里面的 `project_list.json` 取到项目根目录 →
+/// 清掉临时目录。这样列表永远只有一份（就在项目根目录），不用再记别的路径。
+pub fn update_steps(project_root: &Path) -> Vec<JobStep> {
+    let quote = |path: &Path| model::shell_quote(&path.display().to_string());
+
+    let tmp = tmp_dir(project_root);
+    let clone = clone_dir(project_root);
+    let source = clone.join(CONFIG_LIST_FILE);
+    let target = project_root.join(paths::PROJECT_LIST_FILE);
+    // 先落到临时文件再改名：避免列表被读到写了一半的内容
+    let staged = project_root.join(".project_list.json.new");
+
+    let in_root = project_root.to_path_buf();
+
+    vec![
+        // 清掉上次可能残留的克隆（只动我们自己的子目录，不碰 ./tmp 里别的东西）
+        JobStep::user(format!("rm -rf {}", quote(&clone))).in_dir(in_root.clone()),
+        JobStep::user(format!("mkdir -p {}", quote(&tmp))).in_dir(in_root.clone()),
+        // --progress：没有终端时 git 默认不输出进度，而国内克隆这个仓库
+        // 可能要几分钟，看得见进度才分得清是慢还是在卡。
+        JobStep::user(format!(
+            "git clone --depth=1 --progress {CONFIG_REPO_URL} {}",
+            quote(&clone)
+        ))
+        .in_dir(in_root.clone()),
+        JobStep::user(format!("cp {} {}", quote(&source), quote(&staged))).in_dir(in_root.clone()),
+        JobStep::user(format!("mv {} {}", quote(&staged), quote(&target))).in_dir(in_root.clone()),
+        // 收拾临时目录：删掉克隆，tmp/ 空了就一并删掉；这里失败不影响更新结果
+        JobStep::user(format!(
+            "rm -rf {}; rmdir {} 2>/dev/null || true",
+            quote(&clone),
+            quote(&tmp)
+        ))
+        .in_dir(in_root)
+        .optional(),
+    ]
+}
+
 /// 组装好的任务。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedJob {
@@ -238,6 +297,55 @@ mod tests {
         assert!(plan.steps[1].optional);
         assert!(plan.steps[2].optional);
         assert!(!plan.steps[2].needs_root);
+    }
+
+    #[test]
+    fn update_steps_clone_to_tmp_then_extract_and_clean_up() {
+        let root = Path::new("/tmp/proj");
+        let steps = update_steps(root);
+        let commands: Vec<&str> = steps.iter().map(|s| s.command.as_str()).collect();
+
+        let tmp = "/tmp/proj/tmp";
+        let clone = "/tmp/proj/tmp/w-to-l-manager-config";
+        let staged = "/tmp/proj/.project_list.json.new";
+        let target = "/tmp/proj/project_list.json";
+
+        assert_eq!(commands.len(), 6);
+        assert_eq!(commands[0], format!("rm -rf {clone}"), "先清掉上次残留的克隆");
+        assert_eq!(commands[1], format!("mkdir -p {tmp}"));
+        assert_eq!(
+            commands[2],
+            format!("git clone --depth=1 --progress {CONFIG_REPO_URL} {clone}")
+        );
+        // 先落到临时文件再改名：列表不会被读到写了一半的内容
+        assert_eq!(commands[3], format!("cp {clone}/project_list.json {staged}"));
+        assert_eq!(commands[4], format!("mv {staged} {target}"));
+        // 收尾：删掉克隆，tmp/ 空了就一并删掉
+        assert!(commands[5].contains(&format!("rm -rf {clone}")), "{:?}", commands[5]);
+        assert!(commands[5].contains(&format!("rmdir {tmp}")), "{:?}", commands[5]);
+        assert!(steps[5].optional, "清理失败不应影响更新结果");
+
+        // 都在项目根目录里执行，且不需要 root
+        for step in &steps {
+            assert_eq!(step.work_dir, Some(WorkDir::Fixed(root.to_path_buf())));
+            assert!(!step.needs_root);
+        }
+
+        // 路径辅助函数
+        assert_eq!(tmp_dir(root), PathBuf::from(tmp));
+        assert_eq!(clone_dir(root), PathBuf::from(clone));
+    }
+
+    #[test]
+    fn update_steps_quote_paths_with_spaces() {
+        let root = Path::new("/tmp/my proj");
+        for step in update_steps(root) {
+            assert!(
+                step.command.contains("'/tmp/my proj/"),
+                "路径应该加引号：{:?}",
+                step.command
+            );
+        }
     }
 
     #[test]

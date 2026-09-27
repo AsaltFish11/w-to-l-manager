@@ -74,8 +74,33 @@ pub struct InstallRecord {
     pub dependencies: DepRecord,
 }
 
-/// 管理器状态文件的内容。
+/// 执行命令前会导出的一个环境变量。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvVar {
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+impl EnvVar {
+    /// 键名合法、且不是空行才算可用。
+    pub fn is_usable(&self) -> bool {
+        is_valid_env_key(&self.key)
+    }
+}
+
+/// shell 变量名是否合法：字母或下划线开头，后面只能是字母 / 数字 / 下划线。
+pub fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// 管理器状态文件的内容。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagerState {
     /// id → 安装记录。存在即视为“已安装”。
     #[serde(default)]
@@ -83,6 +108,28 @@ pub struct ManagerState {
     /// 状态文件的格式版本，便于以后迁移。
     #[serde(default = "default_version")]
     pub version: u32,
+    /// 启动时是否自动检查一次列表更新。缺省打开。
+    #[serde(default = "default_true")]
+    pub auto_update_on_start: bool,
+    /// 执行命令前要导出的环境变量（按顺序）。
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+}
+
+impl Default for ManagerState {
+    fn default() -> Self {
+        Self {
+            installed: BTreeMap::new(),
+            version: default_version(),
+            // 默认开启：每次启动自动拉一次最新列表
+            auto_update_on_start: true,
+            env: Vec::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_version() -> u32 {
@@ -114,6 +161,15 @@ impl ManagerState {
 
     pub fn mark_uninstalled(&mut self, id: &str) {
         self.installed.remove(id);
+    }
+
+    /// 真正会生效的环境变量（跳过空行和非法键名）。
+    pub fn usable_env(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .filter(|var| var.is_usable())
+            .map(|var| (var.key.clone(), var.value.clone()))
+            .collect()
     }
 
     /// 载入状态；文件不存在时返回空状态。第二个返回值是警告信息。
@@ -312,6 +368,66 @@ mod tests {
         assert!(record.dependencies.auto_packages().is_empty());
         assert_eq!(record.dependencies.manager_name(), None);
         assert_eq!(record.source_dir, None, "旧文件没有 source_dir");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_valid_env_keys_are_used() {
+        // 合法：字母 / 下划线开头
+        assert!(is_valid_env_key("PATH"));
+        assert!(is_valid_env_key("_PRIVATE"));
+        assert!(is_valid_env_key("HTTP_PROXY2"));
+        // 非法：空、数字开头、带等号或空格、中文
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("2FAST"));
+        assert!(!is_valid_env_key("A-B"));
+        assert!(!is_valid_env_key("A B"));
+        assert!(!is_valid_env_key("中文"));
+
+        let mut state = ManagerState::default();
+        assert!(state.usable_env().is_empty(), "默认没有环境变量");
+
+        state.env = vec![
+            EnvVar { key: "GOOD".into(), value: "1".into() },
+            // 空行（界面上的“+ 添加一行”）应被跳过
+            EnvVar::default(),
+            // 键名非法，应被跳过
+            EnvVar { key: "bad key".into(), value: "x".into() },
+            EnvVar { key: "ALSO_GOOD".into(), value: "two words".into() },
+        ];
+        assert_eq!(
+            state.usable_env(),
+            vec![
+                ("GOOD".to_string(), "1".to_string()),
+                ("ALSO_GOOD".to_string(), "two words".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_update_defaults_to_on_and_round_trips() {
+        // 完全没有状态文件时：默认开启
+        assert!(ManagerState::default().auto_update_on_start);
+
+        // 老状态文件没有这个字段：也按开启处理
+        let dir = temp_dir("autoupdate");
+        let path = dir.join(STATE_FILE_NAME);
+        fs::write(
+            &path,
+            r#"{"version":2,"installed":{}}"#,
+        )
+        .unwrap();
+        let (state, warning) = ManagerState::load(&path);
+        assert!(warning.is_none(), "{warning:?}");
+        assert!(state.auto_update_on_start, "缺省应该是开启");
+
+        // 关掉之后能存下来、也能读回来
+        let mut state = state;
+        state.auto_update_on_start = false;
+        state.save(std::slice::from_ref(&path)).unwrap();
+        let (reloaded, _) = ManagerState::load(&path);
+        assert!(!reloaded.auto_update_on_start);
 
         fs::remove_dir_all(&dir).ok();
     }

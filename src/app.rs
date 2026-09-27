@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 use crate::deps::{self, DepPlan, PackageManagerKind};
 use crate::exec::{Console, Job, JobKind, JobOutcome, JobRequest, LogLine, LogStream, StepStatus};
 use crate::fonts::{self, LoadedFont};
-use crate::model::{self, CommandSpec, ProjectEntry, UninstallOrigin, UninstallSupport};
+use crate::model::{self, CommandSpec, ProjectEntry, UninstallSupport};
 use crate::paths;
 use crate::source::{self, CloneState};
 use crate::state::{self, AutoDep, DepRecord, ManagerState};
-use crate::steps::{self, PlannedJob};
+use crate::steps::{self, CONFIG_DIR_NAME, CONFIG_LIST_FILE, CONFIG_REPO_URL, PlannedJob};
 
 /// 窗口标题，同时用作应用名。
 pub const APP_TITLE: &str = "Windows 移植 Linux 管理器";
@@ -95,8 +95,6 @@ enum Dialog {
     ConfirmUninstall {
         project_id: String,
         commands: Vec<CommandSpec>,
-        origin: UninstallOrigin,
-        skipped: Vec<String>,
         /// 由本管理器安装、可选一并移除的依赖
         removable: Vec<AutoDep>,
         /// 安装前就已存在、绝不会被改动的依赖
@@ -127,7 +125,13 @@ enum Action {
 pub struct ManagerApp {
     // ---- 数据源 ----
     list_path_input: String,
+    /// 当前读取的列表文件（可能来自配置仓库的克隆结果）。
     list_path: PathBuf,
+    /// 项目根目录：`sources/`、状态文件都放在这里。
+    ///
+    /// 刻意与 `list_path` 分开：列表可以从别处（配置仓库）读，
+    /// 但源码目录必须稳定地留在项目根目录下。
+    project_root: PathBuf,
     entries: Vec<ProjectEntry>,
     warnings: Vec<String>,
     load_error: Option<String>,
@@ -157,12 +161,17 @@ pub struct ManagerApp {
     active_meta: Option<ActiveMeta>,
     log_follow: bool,
 
+    /// 当前这个更新任务是不是启动时自动发起的（失败时不弹刺眼的错误）。
+    update_automatic: bool,
+
     // ---- 密码弹窗 ----
     /// 已经为哪个请求弹过窗（用于自动聚焦输入框）。
     password_prompt: Option<(usize, String)>,
     password_input: String,
 
     // ---- 弹窗 / 提示 ----
+    /// 设置窗口是否打开。
+    show_settings: bool,
     dialog: Option<Dialog>,
     toast: Option<Toast>,
     show_help: bool,
@@ -186,16 +195,29 @@ impl ManagerApp {
             log::warn!("{err}");
         }
         app.reload();
+        app.maybe_auto_update();
         app
+    }
+
+    /// 启动时按设置决定要不要自动检查更新。
+    fn maybe_auto_update(&mut self) {
+        if !self.state.auto_update_on_start {
+            log::debug!("启动自动更新已关闭，跳过检查");
+            return;
+        }
+        log::info!("启动自动更新已开启，后台检查最新列表");
+        self.begin_update(true);
     }
 
     /// 组装应用状态（不读文件、不画界面），便于测试。
     fn build(list_path: PathBuf, font: Result<LoadedFont, String>) -> Self {
+        // 项目根目录取自最初定位到的列表文件，之后不再跟着列表路径变化。
         let project_root = project_root_of(&list_path);
 
         Self {
             list_path_input: list_path.display().to_string(),
             list_path: list_path.clone(),
+            project_root: project_root.clone(),
             entries: Vec::new(),
             warnings: Vec::new(),
             load_error: None,
@@ -218,10 +240,12 @@ impl ManagerApp {
             job_handled: true,
             active_meta: None,
             log_follow: true,
+            update_automatic: false,
             password_prompt: None,
             password_input: String::new(),
             dialog: None,
             toast: None,
+            show_settings: false,
             show_help: false,
             help_sample: HELP_SAMPLE.to_string(),
             font,
@@ -263,6 +287,17 @@ impl ManagerApp {
                     self.load_error = Some(format!("{} 解析失败：{err}", path.display()));
                 }
             },
+            // 还没有列表文件是很正常的情况：更新会把它写到项目根目录。
+            // 这里给一句人话提示，而不是甩一个 No such file 的错误。
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                log::warn!("{} 还不存在", path.display());
+                let hint = if self.state.auto_update_on_start {
+                    "还没有列表文件；正在从配置仓库获取，国内可能比较慢（可看下方日志）"
+                } else {
+                    "还没有列表文件；可以点「立即更新」从配置仓库获取"
+                };
+                self.load_error = Some(hint.to_string());
+            }
             Err(err) => {
                 log::error!("无法读取 {}：{err}", path.display());
                 self.load_error = Some(format!("无法读取 {}：{err}", path.display()));
@@ -273,12 +308,11 @@ impl ManagerApp {
         self.refresh_dependencies();
         self.manager = deps::detect();
 
-        let project_root = project_root_of(&path);
         if changed_path {
-            self.state_paths = paths::state_file_candidates(&project_root);
-            self.work_dir_input = project_root.display().to_string();
-            self.load_state();
-        } else if self.state_file.is_none() {
+            log::info!("列表文件切换为 {}", path.display());
+        }
+        // 状态文件与工作目录都绑定在项目根目录上，不随列表文件位置变化。
+        if self.state_file.is_none() {
             self.load_state();
         }
     }
@@ -430,14 +464,43 @@ impl ManagerApp {
                             .unwrap_or_default();
                         self.state
                             .mark_installed(&project_id, commands, source_dir, record);
+                        self.save_state();
+                        self.refresh_dependencies();
+                        self.set_toast(
+                            format!("{project_id} {}完成", kind.past()),
+                            ToastKind::Ok,
+                        );
                     }
-                    JobKind::Uninstall => self.state.mark_uninstalled(&project_id),
+                    JobKind::Uninstall => {
+                        self.state.mark_uninstalled(&project_id);
+                        self.save_state();
+                        self.refresh_dependencies();
+                        self.set_toast(
+                            format!("{project_id} {}完成", kind.past()),
+                            ToastKind::Ok,
+                        );
+                    }
+                    JobKind::Update => {
+                        self.update_automatic = false;
+                        self.apply_update();
+                    }
                 }
-                self.save_state();
-                self.refresh_dependencies();
-                self.set_toast(format!("{project_id} {}完成", kind.past()), ToastKind::Ok);
+            }
+            JobOutcome::Failed if kind == JobKind::Update && self.update_automatic => {
+                self.update_automatic = false;
+                self.clean_update_tmp();
+                log::warn!("启动自动更新失败（继续使用当前列表）：{message}");
+                self.set_toast(
+                    "启动自动更新失败（可能是网络问题），继续使用当前列表；可点「立即更新」重试"
+                        .to_string(),
+                    ToastKind::Warn,
+                );
             }
             JobOutcome::Failed => {
+                if kind == JobKind::Update {
+                    self.update_automatic = false;
+                    self.clean_update_tmp();
+                }
                 // sudo 说密码不对 / 需要密码：把内存里的密码丢掉，下次重新问
                 let auth_hint = if auth_failed {
                     self.sudo_password.clear();
@@ -456,10 +519,139 @@ impl ManagerApp {
                 );
             }
             JobOutcome::Cancelled => {
+                if kind == JobKind::Update {
+                    // 取消 / 失败时不会走到清理步骤，这里补上，别留下临时目录
+                    self.update_automatic = false;
+                    self.clean_update_tmp();
+                }
                 self.set_toast(format!("{project_id} 的任务已取消"), ToastKind::Warn);
             }
             JobOutcome::Running => {}
         }
+    }
+
+    /// 从配置仓库拉取最新的 `project_list.json`。
+    ///
+    /// 每次都重新克隆（`--depth=1`，仓库很小）：既保证拿到最新的一份，
+    /// 也免去“上次克隆残留”的各种麻烦。
+    /// 如果当前占着任务位的只是「启动自动更新」，就让给用户的操作。
+    fn yield_automatic_update(&mut self) {
+        if !self.busy() || !self.update_automatic {
+            return;
+        }
+        log::info!("用户操作优先：取消正在进行的启动自动更新");
+        if let Some(job) = &self.job {
+            job.cancel();
+        }
+        // 丢弃这个任务，后续按用户的操作走
+        self.job = None;
+        self.job_handled = true;
+        self.update_automatic = false;
+    }
+
+    fn begin_update(&mut self, automatic: bool) {
+        self.yield_automatic_update();
+        if self.busy() {
+            if !automatic {
+                self.set_toast("已有任务正在执行，请先等待或取消".to_string(), ToastKind::Warn);
+            }
+            return;
+        }
+        if paths::which("git").is_none() {
+            if automatic {
+                log::warn!("系统里找不到 git，跳过启动自动更新");
+            } else {
+                self.set_toast("系统里找不到 git，无法更新列表".to_string(), ToastKind::Error);
+            }
+            return;
+        }
+
+        self.update_automatic = automatic;
+        if !automatic {
+            self.set_toast(
+                "开始拉取最新列表…（国内可能较慢，日志里会显示进度）".to_string(),
+                ToastKind::Ok,
+            );
+        }
+        let root = self.project_root.clone();
+        let steps = steps::update_steps(&root);
+
+        log::info!(
+            "开始{}更新列表：{} -> {}（临时目录 {}）",
+            if automatic { "自动" } else { "手动" },
+            CONFIG_REPO_URL,
+            root.join(paths::PROJECT_LIST_FILE).display(),
+            steps::clone_dir(&root).display()
+        );
+
+        self.console.push(LogLine {
+            job_id: 0,
+            project_id: CONFIG_DIR_NAME.to_string(),
+            step: 0,
+            stream: LogStream::Info,
+            text: format!("──────── {} ────────", JobKind::Update.gerund()),
+        });
+
+        self.active_meta = Some(ActiveMeta {
+            project_id: CONFIG_DIR_NAME.to_string(),
+            kind: JobKind::Update,
+            dep_record: DepRecord::default(),
+            source_dir: None,
+        });
+        self.job = Some(Job::spawn(JobRequest {
+            project_id: CONFIG_DIR_NAME.to_string(),
+            kind: JobKind::Update,
+            steps,
+            work_dir: root,
+            sudo_password: None,
+            source_base: None,
+            env: self.state.usable_env(),
+            console: self.console.clone(),
+        }));
+        self.job_handled = false;
+        self.toast = None;
+        self.log_follow = true;
+    }
+
+    /// 收拾更新用的临时目录：删掉克隆，`tmp/` 空了就一并删掉。
+    ///
+    /// 正常情况下由任务里的清理步骤完成；任务失败或取消时走不到那一步，
+    /// 就在这里兜一下，免得留下半个仓库。
+    fn clean_update_tmp(&mut self) {
+        let clone = steps::clone_dir(&self.project_root);
+        match fs::remove_dir_all(&clone) {
+            Ok(()) => log::info!("已清理临时克隆目录 {}", clone.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => log::warn!("清理 {} 失败：{err}", clone.display()),
+        }
+
+        let tmp = steps::tmp_dir(&self.project_root);
+        match fs::remove_dir(&tmp) {
+            Ok(()) => log::info!("已删除空的临时目录 {}", tmp.display()),
+            // 目录非空（里面还有别人的东西）或不存在：都保持原样
+            Err(_) => log::debug!("{} 未删除（不存在或非空）", tmp.display()),
+        }
+    }
+
+    /// 更新任务成功后：列表已经被换到项目根目录，重新读一遍即可。
+    fn apply_update(&mut self) {
+        let list = self.project_root.join(paths::PROJECT_LIST_FILE);
+        if !list.is_file() {
+            let message = format!("更新完成，但没有找到 {}", list.display());
+            log::error!("{message}");
+            self.set_toast(message, ToastKind::Error);
+            return;
+        }
+
+        // 列表永远读项目根目录下这一份，所以把路径也拉回来（用户之前可能手动改到别处）
+        self.list_path_input = list.display().to_string();
+        log::info!("列表已更新：{}", list.display());
+        self.reload();
+
+        self.set_toast(
+            format!("列表已更新（{} 个条目）", self.entries.len()),
+            ToastKind::Ok,
+        );
     }
 
     /// 当前有没有正在跑的任务。
@@ -556,6 +748,7 @@ impl ManagerApp {
             work_dir,
             sudo_password: self.job_password(),
             source_base: plan.source_base,
+            env: self.state.usable_env(),
             console: self.console.clone(),
         }));
         self.job_handled = false;
@@ -568,6 +761,9 @@ impl ManagerApp {
     // -----------------------------------------------------------------
 
     fn handle_action(&mut self, action: Action) {
+        // 启动自动更新可能要跑好几分钟（国内克隆很慢），
+        // 用户主动点安装/卸载时应该让路，而不是被挡住。
+        self.yield_automatic_update();
         if self.busy() {
             self.set_toast("已有任务正在执行，请先等待或取消".to_string(), ToastKind::Warn);
             return;
@@ -642,18 +838,15 @@ impl ManagerApp {
         let removable = record.dependencies.auto_installed.clone();
         let untouched = record.dependencies.pre_existing.clone();
         log::info!(
-            "点击卸载：{}（{} 条命令，来源 {:?}，可移除依赖 {} 个）",
+            "点击卸载：{}（{} 条命令，可移除依赖 {} 个）",
             entry.id,
             plan.commands.len(),
-            plan.origin,
             removable.len()
         );
 
         self.dialog = Some(Dialog::ConfirmUninstall {
             project_id: entry.id.clone(),
             commands: plan.commands,
-            origin: plan.origin,
-            skipped: plan.skipped,
             removable,
             untouched,
             // 默认不动依赖和源码，避免误删
@@ -702,7 +895,23 @@ impl ManagerApp {
                 if ui.button("重新读取").clicked() {
                     self.reload();
                 }
-                ui.checkbox(&mut self.auto_reload, "自动重载");
+                let response = ui
+                    .add_enabled(
+                        !self.busy(),
+                        egui::Button::new(RichText::new("立即更新").strong()),
+                    )
+                    .on_hover_text(format!(
+                        "从配置仓库拉取最新的 {CONFIG_LIST_FILE}\n{CONFIG_REPO_URL}"
+                    ))
+                    .on_disabled_hover_text("已有任务正在执行");
+                if response.clicked() {
+                    self.begin_update(false);
+                }
+                ui.checkbox(&mut self.auto_reload, "自动重载")
+                    .on_hover_text("列表文件内容变化时自动重新读取");
+                if ui.button("设置").clicked() {
+                    self.show_settings = true;
+                }
                 if ui.button("格式说明").clicked() {
                     self.show_help = true;
                 }
@@ -780,24 +989,16 @@ impl ManagerApp {
                 }
             });
 
-            // --- 工作目录 ---
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("工作目录：");
-                let width = (ui.available_width() - 140.0).clamp(180.0, 520.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.work_dir_input)
-                        .desired_width(width)
-                        .hint_text("没有 clone-command 的项目在此目录下构建"),
-                );
-                if ui.small_button("用列表目录").clicked() {
-                    self.work_dir_input = project_root_of(&self.list_path).display().to_string();
-                }
-            });
-
             // --- 文件位置（次要信息，小字放一行）---
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("项目目录：{}", self.project_root.display()))
+                        .color(MUTED)
+                        .small(),
+                )
+                .on_hover_text("源码目录 sources/ 与状态文件都放在这里，不随列表文件位置变化");
+                status_divider(ui);
                 if let Some(path) = &self.state_file {
                     ui.label(
                         RichText::new(format!("状态文件：{}", path.display()))
@@ -869,7 +1070,7 @@ impl ManagerApp {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             RichText::new(if self.load_error.is_some() {
-                                "列表为空：请先修复 project_list.json"
+                                "暂时没有可显示的列表，请看上方提示"
                             } else {
                                 "project_list.json 里没有任何条目"
                             })
@@ -907,7 +1108,7 @@ impl ManagerApp {
         let clone_command = entry.clone_command.clone();
         let source_base = entry
             .needs_clone()
-            .then(|| paths::project_source_base(&project_root_of(&self.list_path), &entry.id));
+            .then(|| paths::project_source_base(&self.project_root, &entry.id));
 
         let record = self.state.installed.get(&id).cloned();
         let installed = record.is_some();
@@ -961,16 +1162,8 @@ impl ManagerApp {
             String::new()
         };
 
-        let origin_label = match &plan {
-            UninstallSupport::Available(p) => Some(p.origin),
-            UninstallSupport::Unavailable { .. } => None,
-        };
         let uninstall_commands: Vec<CommandSpec> = match &plan {
             UninstallSupport::Available(p) => p.commands.clone(),
-            UninstallSupport::Unavailable { .. } => Vec::new(),
-        };
-        let skipped = match &plan {
-            UninstallSupport::Available(p) => p.skipped.clone(),
             UninstallSupport::Unavailable { .. } => Vec::new(),
         };
 
@@ -1048,12 +1241,27 @@ impl ManagerApp {
                             if index > 0 {
                                 status_divider(ui);
                             }
-                            ui.hyperlink_to(
-                                RichText::new(format!("{icon} {}", short_url(url)))
-                                    .color(INFO_BLUE),
-                                url,
-                            )
-                            .on_hover_text(format!("{url}\n点击用系统浏览器打开"));
+                            // 自己处理点击：egui 的 hyperlink 依赖 links feature
+                            let response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!("{icon} {}", short_url(url)))
+                                            .color(INFO_BLUE)
+                                            .underline(),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(format!("{url}\n点击用系统默认浏览器打开"));
+                            if response.clicked() {
+                                match crate::open::open_url(url) {
+                                    Ok(()) => self.set_toast(
+                                        format!("已在浏览器中打开 {url}"),
+                                        ToastKind::Ok,
+                                    ),
+                                    Err(err) => self.set_toast(err, ToastKind::Error),
+                                }
+                            }
                         }
                     });
                 }
@@ -1158,49 +1366,16 @@ impl ManagerApp {
                         }
 
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("卸载命令").strong());
-                            match origin_label {
-                                Some(UninstallOrigin::Author) => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{}：来自 project_list.json 的 uninstall-commands",
-                                            UninstallOrigin::Author.label()
-                                        ))
-                                        .color(OK_GREEN)
-                                        .small(),
-                                    );
-                                }
-                                Some(UninstallOrigin::Derived) => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{}：由 install-commands 推导，执行前请核对",
-                                            UninstallOrigin::Derived.label()
-                                        ))
-                                        .color(WARN_AMBER)
-                                        .small(),
-                                    );
-                                }
-                                None => {}
-                            }
-                        });
+                        ui.label(RichText::new("卸载命令").strong());
                         if uninstall_commands.is_empty() {
-                            ui.label(RichText::new("  （无，无法卸载）").color(MUTED));
+                            ui.label(
+                                RichText::new("  （没有，无法卸载；需要在 JSON 里写 uninstall-commands）")
+                                    .color(MUTED),
+                            );
                         } else {
                             for (i, spec) in uninstall_commands.iter().enumerate() {
                                 permission_line(ui, i + 1, spec);
                             }
-                        }
-                        if !skipped.is_empty() {
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new(format!(
-                                    "以下安装命令没有对应的卸载命令，卸载时会跳过：{}",
-                                    skipped.join("；")
-                                ))
-                                .color(MUTED)
-                                .small(),
-                            );
                         }
 
                         if !auto_deps.is_empty() {
@@ -1268,6 +1443,15 @@ impl ManagerApp {
                                 .desired_width(150.0)
                                 .text(format!("{done}/{total}")),
                             );
+                            // 慢任务（国内克隆仓库）让人一眼看出已经跑了多久
+                            if guard.is_running() {
+                                let secs = state::now_secs().saturating_sub(guard.started_at);
+                                ui.label(
+                                    RichText::new(format!("已耗时 {}", short_duration(secs)))
+                                        .color(MUTED)
+                                        .small(),
+                                );
+                            }
                             if guard.is_running() && ui.button("取消").clicked() {
                                 cancel_requested = true;
                             }
@@ -1476,8 +1660,6 @@ impl ManagerApp {
             Dialog::ConfirmUninstall {
                 project_id,
                 commands,
-                origin,
-                skipped,
                 removable,
                 untouched,
                 remove_deps,
@@ -1486,8 +1668,6 @@ impl ManagerApp {
                 ctx,
                 project_id,
                 commands,
-                origin,
-                skipped,
                 removable,
                 untouched,
                 remove_deps,
@@ -1727,7 +1907,7 @@ impl ManagerApp {
         let mut close = false;
         let mut confirmed = false;
 
-        let project_root = project_root_of(&self.list_path);
+        let project_root = self.project_root.clone();
         let entry = self.entries.iter().find(|e| e.id == project_id).cloned();
         let needs_clone = entry.as_ref().is_some_and(|e| e.needs_clone());
         let clone_command = entry.as_ref().and_then(|e| e.clone_command.clone());
@@ -1875,8 +2055,6 @@ impl ManagerApp {
         ctx: &egui::Context,
         project_id: String,
         commands: Vec<CommandSpec>,
-        origin: UninstallOrigin,
-        skipped: Vec<String>,
         removable: Vec<AutoDep>,
         untouched: Vec<String>,
         mut remove_deps: bool,
@@ -1884,13 +2062,12 @@ impl ManagerApp {
     ) -> Option<Dialog> {
         let mut close = false;
         let mut confirmed = false;
-        let derived = origin == UninstallOrigin::Derived;
         let remove_packages: Vec<String> = removable.iter().map(|d| d.package.clone()).collect();
         let remove_manager = removable
             .iter()
             .find_map(|d| PackageManagerKind::from_name(&d.manager));
 
-        let project_root = project_root_of(&self.list_path);
+        let project_root = self.project_root.clone();
         let entry = self.entries.iter().find(|e| e.id == project_id).cloned();
         let source_dir = entry
             .as_ref()
@@ -1909,32 +2086,15 @@ impl ManagerApp {
             ui.heading(format!("确认卸载：{project_id}"));
             ui.add_space(6.0);
 
-            if derived {
-                ui.label(
-                    RichText::new(
-                        "这些卸载命令是根据 install-commands 自动推导的，可能与实际情况不符，请仔细核对。",
-                    )
-                    .color(WARN_AMBER),
-                );
-            } else {
-                ui.label(
-                    RichText::new("这些卸载命令来自 project_list.json 的 uninstall-commands。")
-                        .color(MUTED),
-                );
-            }
+            ui.label(
+                RichText::new("这些卸载命令来自 project_list.json 的 uninstall-commands。")
+                    .color(MUTED),
+            );
 
             ui.add_space(6.0);
             ui.label(RichText::new("将要依次执行：").strong());
             for (i, spec) in commands.iter().enumerate() {
                 permission_line(ui, i + 1, spec);
-            }
-            if !skipped.is_empty() {
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!("将被跳过（无对应卸载命令）：{}", skipped.join("；")))
-                        .color(MUTED)
-                        .small(),
-                );
             }
 
             // 依赖处理：只动自己装的
@@ -2054,13 +2214,178 @@ impl ManagerApp {
         Some(Dialog::ConfirmUninstall {
             project_id,
             commands,
-            origin,
-            skipped,
             removable,
             untouched,
             remove_deps,
             remove_sources,
         })
+    }
+
+    /// 设置窗口：更新 / 执行 / 位置。
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let was_open = self.show_settings;
+        let mut open = self.show_settings;
+        let mut update_now = false;
+        let mut add_row = false;
+        let mut remove_row: Option<usize> = None;
+
+        let max_height = (ctx.content_rect().height() - 96.0).max(240.0);
+        egui::Window::new("设置")
+            .open(&mut open)
+            .resizable(true)
+            .vscroll(true)
+            .default_size([620.0, 560.0])
+            .max_height(max_height)
+            .show(ctx, |ui| {
+                // ---------------- 更新 ----------------
+                ui.heading("更新");
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.state.auto_update_on_start, "启动时自动更新列表")
+                    .on_hover_text("每次启动时后台从配置仓库拉一次最新的列表");
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!("配置仓库：{CONFIG_REPO_URL}"))
+                        .color(MUTED)
+                        .small(),
+                );
+                ui.add_space(4.0);
+                let response = ui.add_enabled(!self.busy(), egui::Button::new("立即更新"));
+                if response.clicked() {
+                    update_now = true;
+                }
+                ui.label(
+                    RichText::new("更新会把仓库里的 project_list.json 覆盖到项目根目录")
+                        .color(MUTED)
+                        .small(),
+                );
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // ---------------- 执行 ----------------
+                ui.heading("执行");
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("工作目录：");
+                    let width = (ui.available_width() - 120.0).clamp(160.0, 420.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.work_dir_input)
+                            .desired_width(width)
+                            .hint_text("没有 clone-command 的项目在此目录下构建"),
+                    );
+                    if ui.small_button("用项目目录").clicked() {
+                        self.work_dir_input = self.project_root.display().to_string();
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("命令环境变量").strong());
+                ui.label(
+                    RichText::new("下面这些变量会在每条命令执行前先导出（root 命令同样生效）")
+                        .color(MUTED)
+                        .small(),
+                );
+                ui.add_space(4.0);
+
+                let mut invalid: Vec<String> = Vec::new();
+                for (index, var) in self.state.env.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut var.key)
+                                .desired_width(150.0)
+                                .hint_text("KEY"),
+                        );
+                        ui.label("=");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut var.value)
+                                .desired_width(240.0)
+                                .hint_text("值"),
+                        );
+                        if ui.small_button("删除").clicked() {
+                            remove_row = Some(index);
+                        }
+                    });
+                    if !var.key.trim().is_empty() && !var.is_usable() {
+                        invalid.push(var.key.clone());
+                    }
+                }
+                if ui.button("+ 添加一行").clicked() {
+                    add_row = true;
+                }
+                if !invalid.is_empty() {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "⚠ 这些键名不合法，会被忽略：{}（只能字母/下划线开头）",
+                            invalid.join("、")
+                        ))
+                        .color(WARN_AMBER)
+                        .small(),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // ---------------- 位置 ----------------
+                ui.heading("位置");
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("项目目录：{}", self.project_root.display()))
+                        .color(MUTED)
+                        .small(),
+                );
+                if let Some(path) = &self.state_file {
+                    ui.label(
+                        RichText::new(format!("状态文件：{}", path.display()))
+                            .color(MUTED)
+                            .small(),
+                    );
+                }
+                match crate::logging::current_path() {
+                    Some(path) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "日志文件：{}（{} 级）",
+                                path.display(),
+                                crate::logging::level_name(crate::logging::current_level())
+                            ))
+                            .color(MUTED)
+                            .small(),
+                        );
+                    }
+                    None => {
+                        ui.label(RichText::new("日志：仅输出到 stderr").color(MUTED).small());
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("设置保存在状态文件里，关闭本窗口时写入")
+                        .color(MUTED)
+                        .small(),
+                );
+            });
+
+        if let Some(index) = remove_row {
+            self.state.env.remove(index);
+        }
+        if add_row {
+            self.state.env.push(state::EnvVar::default());
+        }
+        if update_now {
+            self.begin_update(false);
+        }
+
+        // 关窗时保存（不在每次按键时写文件）
+        if was_open && !open {
+            log::info!(
+                "保存设置：自动更新={}，环境变量 {} 条",
+                self.state.auto_update_on_start,
+                self.state.env.len()
+            );
+            self.save_state();
+        }
+        self.show_settings = open;
     }
 
     fn help_window(&mut self, ctx: &egui::Context) {
@@ -2120,11 +2445,12 @@ impl ManagerApp {
                      4. 可以顺手删除克隆下来的源码目录（默认保留）。",
                 );
                 ui.add_space(8.0);
-                ui.label(RichText::new("卸载命令推导").strong());
+                ui.label(RichText::new("卸载命令").strong());
                 ui.label(
-                    "若未提供 uninstall-commands，管理器会尝试从 install-commands 推导\
-                     （例如 make install → make uninstall），权限沿用原命令的声明。\
-                     推导出的命令会标注“自动推导”；无法推导时卸载按钮会被禁用。",
+                    "卸载只执行 uninstall-commands 里写好的命令，**不做任何推导**：\
+                     从 install-commands 反推（比如 make install → make uninstall）并不可靠，\
+                     改写出来的命令有可能删错东西。没有写 uninstall-commands 的条目无法卸载，\
+                     列表里会直接提示。",
                 );
 
                 ui.add_space(8.0);
@@ -2186,6 +2512,15 @@ const HELP_SAMPLE: &str = r#"{
         }
     ]
 }"#;
+
+/// 把秒数写成「1 分 05 秒」这样的人话。
+fn short_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs} 秒")
+    } else {
+        format!("{} 分 {:02} 秒", secs / 60, secs % 60)
+    }
+}
 
 /// 链接的显示文本：去掉协议和 `www.`，看着短一点。
 ///
@@ -2316,6 +2651,7 @@ impl eframe::App for ManagerApp {
         egui::CentralPanel::default().show(ui, |ui| self.central(ui));
         self.dialogs(&ctx);
         self.password_modal(&ctx);
+        self.settings_window(&ctx);
         self.help_window(&ctx);
 
         if self.busy() {
@@ -2478,6 +2814,117 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    const OTHER_ENTRY: &str = r#"{
+        "lists": [
+            {
+                "id": "another-project",
+                "author": "someone",
+                "describe": "来自配置仓库的条目",
+                "github-url": "https://github.com/example/another",
+                "bilibili-url": "https://www.bilibili.com/video/BVxxxx",
+                "install-commands": [ { "permission": "normal", "command": "make" } ]
+            }
+        ]
+    }"#;
+
+    /// 点「立即更新」成功后：项目根目录下的列表被换成最新的一份。
+    #[test]
+    fn update_reloads_the_list_from_the_project_root() {
+        let (mut app, dir) = setup("update", ONE_ENTRY);
+        assert_eq!(app.entries[0].id, "demo");
+
+        // 模拟更新流程的结果：配置仓库里的内容已经被取到项目根目录
+        fs::write(dir.join("project_list.json"), OTHER_ENTRY).unwrap();
+
+        app.apply_update();
+
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].id, "another-project");
+        assert_eq!(app.entries[0].author(), Some("someone"));
+        assert_eq!(app.entries[0].links().len(), 2, "github + bilibili");
+        assert!(app.load_error.is_none());
+
+        // 列表永远读项目根目录下那一份
+        assert_eq!(app.list_path, dir.join("project_list.json"));
+        assert_eq!(
+            app.list_path_input,
+            dir.join("project_list.json").display().to_string()
+        );
+        assert!(matches!(
+            app.toast.as_ref().map(|t| t.kind),
+            Some(ToastKind::Ok)
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 克隆出来的目录里没有列表文件时，要报错而不是把列表清空。
+    #[test]
+    fn update_without_the_list_file_reports_an_error() {
+        let (mut app, dir) = setup("update-missing", ONE_ENTRY);
+        let before = app.list_path.clone();
+
+        // 更新后项目根目录下没有列表文件（比如仓库结构不对）
+        fs::remove_file(dir.join("project_list.json")).unwrap();
+        app.apply_update();
+
+        assert_eq!(app.list_path, before, "不该切换路径");
+        assert_eq!(app.entries[0].id, "demo", "原有列表应保持不变");
+        assert!(matches!(
+            app.toast.as_ref().map(|t| t.kind),
+            Some(ToastKind::Error)
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+
+    /// 关掉「启动自动更新」后不该发起任何任务（也就不会联网）。
+    #[test]
+    fn auto_update_is_skipped_when_disabled() {
+        let (mut app, dir) = setup("auto-off", ONE_ENTRY);
+        app.state.auto_update_on_start = false;
+
+        app.maybe_auto_update();
+
+        assert!(app.job.is_none(), "关闭时不该发起更新任务");
+        assert!(app.toast.is_none(), "关闭时也不该打扰用户");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 启动自动更新占着任务位时，用户点安装应该能把它挤掉，而不是被挡住。
+    #[test]
+    fn user_action_preempts_the_automatic_update() {
+        let (mut app, dir) = setup("preempt", ONE_ENTRY);
+        let entry = app.entries[0].clone();
+
+        let console = Console::new(false);
+        app.job = Some(Job::spawn(JobRequest {
+            project_id: steps::CONFIG_DIR_NAME.to_string(),
+            kind: JobKind::Update,
+            steps: vec![crate::exec::JobStep::user("sleep 30")],
+            work_dir: dir.clone(),
+            sudo_password: None,
+            source_base: None,
+            env: Vec::new(),
+            console,
+        }));
+        app.update_automatic = true;
+        assert!(app.busy());
+
+        app.handle_action(Action::Install(Box::new(entry)));
+
+        assert!(!app.update_automatic, "自动更新标记应被清掉");
+        assert!(
+            matches!(app.dialog, Some(Dialog::ConfirmInstall { .. })),
+            "安装确认框应该正常弹出"
+        );
+        assert!(app.toast.is_none() || !matches!(app.toast.as_ref().unwrap().kind, ToastKind::Warn));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn action_while_busy_is_rejected_with_a_toast() {
         let (mut app, dir) = setup("busy", ONE_ENTRY);
@@ -2492,6 +2939,7 @@ mod tests {
             work_dir: dir.clone(),
             sudo_password: None,
             source_base: None,
+            env: Vec::new(),
             console,
         }));
         assert!(app.busy());
