@@ -6,15 +6,16 @@
 //! 后续 `make` 就会在半个仓库里跑，报出“找不到 makefile”这种莫名其妙的错误。
 
 use std::path::Path;
-use std::process::Command;
 
 use crate::exec::JobStep;
 use crate::model::shell_quote;
-use crate::paths;
 
-/// 克隆成功后由我们自己写下的标记文件。
+/// 克隆成功后由我们自己写下的「完整性标记」文件。
 ///
-/// 有它就说明“这个目录是本管理器完整克隆过的”，可以直接复用。
+/// **它是否存在，是判断源码能不能复用的唯一依据**：
+/// 在 → 这个目录是一次完整的克隆，可以直接构建；
+/// 不在 → 上次克隆没有跑完（失败 / 被取消 / 被删掉），目录里的东西不可信，
+/// 必须先删掉整个目录再重新克隆。
 pub const CLONE_MARKER: &str = ".w2l-clone-ok";
 
 /// 已有源码时怎么处理。
@@ -46,53 +47,13 @@ impl CloneState {
     }
 }
 
-/// 这个源码目录里是否已经有**完整**的源码可以拿来构建。
+/// 这个源码目录里是不是已经有一次**完整**的克隆。
 ///
-/// 判断顺序：
-/// 1. 有我们自己写的标记文件 → 完整；
-/// 2. 是个 git 仓库 → 看签出是否完整（索引里的文件是否都在工作区）；
-/// 3. 其它情况 → 认为不完整（宁可重新克隆，也不要在半成品上构建）。
+/// 判据只有一个：克隆成功之后写下的 [`CLONE_MARKER`] 在不在。
+/// 不看目录是否非空 —— `git clone` 是先建目录再签出文件的，
+/// 只签出了一半的目录同样“非空”，拿它去构建只会得到莫名其妙的错误。
 pub fn has_complete_sources(base: &Path) -> bool {
-    if !base.is_dir() {
-        return false;
-    }
-    if base.join(CLONE_MARKER).is_file() {
-        return true;
-    }
-
-    let root = paths::resolve_source_root(base);
-    if !root.join(".git").exists() {
-        return false;
-    }
-    is_git_checkout_complete(&root)
-}
-
-/// git 仓库的签出是否完整。
-///
-/// 只看「索引里有、工作区缺失」的文件（`git status --porcelain` 里第二列为 `D`），
-/// 因为那正是克隆没做完的特征；用户自己改过的文件（`M`）不算数，免得把改动删掉。
-pub fn is_git_checkout_complete(root: &Path) -> bool {
-    if paths::which("git").is_none() {
-        return false;
-    }
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["status", "--porcelain", "--untracked-files=no"])
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            !text.lines().any(|line| {
-                let mut chars = line.chars();
-                let _staged = chars.next();
-                matches!(chars.next(), Some('D'))
-            })
-        }
-        _ => false,
-    }
+    base.join(CLONE_MARKER).is_file()
 }
 
 /// 生成「准备源码」的步骤。
@@ -148,41 +109,6 @@ mod tests {
 
     fn base() -> PathBuf {
         PathBuf::from("/tmp/proj/sources/demo")
-    }
-
-    fn git_available() -> bool {
-        paths::which("git").is_some()
-    }
-
-    /// 造一个真实的 git 仓库（带一次提交）。
-    fn init_repo(dir: &Path) {
-        fs::create_dir_all(dir).unwrap();
-        let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
-                .expect("git 应该能运行");
-            assert!(
-                status.status.success(),
-                "git {args:?} 失败：{}",
-                String::from_utf8_lossy(&status.stderr)
-            );
-        };
-        run(&["init", "-q"]);
-        fs::write(dir.join("Makefile"), "all:\n\t@echo built\n").unwrap();
-        fs::write(dir.join("main.c"), "int main(void){return 0;}\n").unwrap();
-        run(&["add", "."]);
-        run(&[
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=test",
-            "commit",
-            "-qm",
-            "init",
-        ]);
     }
 
     #[test]
@@ -258,94 +184,75 @@ mod tests {
         );
     }
 
-    /// 回归测试：目录存在但只签出了一半时，绝不能当成“已克隆好”。
-    /// 用户遇到的就是这个：`git clone` 先建目录、再慢慢签出文件，
-    /// 中途被取消后 `make` 在半个仓库里跑，报“找不到 makefile”。
+    /// 标记必须排在克隆步骤**之后**：克隆失败或被取消时任务会中断，
+    /// 标记就不会被写下来，下次安装才知道要重来。
     #[test]
-    fn partially_checked_out_repo_is_not_treated_as_complete() {
-        if !git_available() {
-            eprintln!("跳过：没有 git");
-            return;
+    fn the_marker_is_written_only_after_the_clone() {
+        for state in [CloneState::Fresh, CloneState::ReClone] {
+            let steps = clone_steps(Path::new("/tmp/proj"), &base(), "git clone x", state);
+            let clone_at = steps
+                .iter()
+                .position(|s| s.command == "git clone x")
+                .expect("应该有克隆步骤");
+            let marker_at = steps
+                .iter()
+                .position(|s| s.command.contains(CLONE_MARKER))
+                .unwrap_or_else(|| panic!("{state:?} 应该写标记"));
+            assert!(clone_at < marker_at, "{state:?}：标记必须在克隆之后");
+            assert_eq!(marker_at, steps.len() - 1, "标记应该是最后一步");
         }
 
-        let root = temp_dir("partial");
-        let base = root.join("sources").join("demo");
-        let repo = base.join("cmd");
-        init_repo(&repo);
-
-        // 完整签出 → 可以复用
-        assert!(has_complete_sources(&base), "完整仓库应被认作可用");
-        assert_eq!(CloneState::decide(&base, false), CloneState::Existing);
-
-        // 模拟“克隆只做了一半”：删掉工作区里的文件（索引里还在）
-        fs::remove_file(repo.join("Makefile")).unwrap();
-        assert!(!has_complete_sources(&base), "签出不完整时不该被认作可用");
-        assert_eq!(
-            CloneState::decide(&base, false),
-            CloneState::ReClone,
-            "不完整时必须重新克隆"
+        // 复用已有源码时不会碰标记
+        let steps = clone_steps(
+            Path::new("/tmp/proj"),
+            &base(),
+            "git clone x",
+            CloneState::Existing,
         );
-
-        let _ = fs::remove_dir_all(&root);
+        assert!(!steps.iter().any(|s| s.command.contains(CLONE_MARKER)));
     }
 
+    /// 核心规则：**只有标记文件**能证明这是一次完整的克隆。
     #[test]
-    fn empty_or_foreign_directories_are_recloned() {
-        let root = temp_dir("empty");
+    fn only_the_marker_proves_the_clone_is_complete() {
+        let root = temp_dir("marker");
 
-        // 目录不存在 → Fresh
+        // 目录不存在 → 全新克隆
         let missing = root.join("missing");
+        assert!(!has_complete_sources(&missing));
         assert_eq!(CloneState::decide(&missing, false), CloneState::Fresh);
 
-        // 空目录（mkdir 建出来但克隆没跑）→ 重新克隆
+        // 目录在但没标记（上次克隆只建出目录就被取消了）→ 重来
         let empty = root.join("empty");
         fs::create_dir_all(&empty).unwrap();
         assert!(!has_complete_sources(&empty));
         assert_eq!(CloneState::decide(&empty, false), CloneState::ReClone);
 
-        // 只有一层空子目录（克隆刚开始）→ 重新克隆
+        // 只签出了一半 → 重来
         let half = root.join("half");
         fs::create_dir_all(half.join("cmd")).unwrap();
         assert!(!has_complete_sources(&half));
         assert_eq!(CloneState::decide(&half, false), CloneState::ReClone);
 
-        // 不是 git 仓库、也没写过标记 → 重新克隆
-        let plain = root.join("plain");
-        fs::create_dir_all(&plain).unwrap();
-        fs::write(plain.join("Makefile"), "all:\n").unwrap();
-        assert!(!has_complete_sources(&plain));
-        assert_eq!(CloneState::decide(&plain, false), CloneState::ReClone);
-
-        // 有标记文件 → 直接复用
-        let marked = root.join("marked");
-        fs::create_dir_all(&marked).unwrap();
-        fs::write(marked.join(CLONE_MARKER), "").unwrap();
-        assert!(has_complete_sources(&marked));
-        assert_eq!(CloneState::decide(&marked, false), CloneState::Existing);
-
-        // 用户要求重新克隆时优先级最高
-        assert_eq!(CloneState::decide(&marked, true), CloneState::ReClone);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// 用户自己改过文件不该被当成“没克隆好”，否则重新克隆会删掉他的改动。
-    #[test]
-    fn local_modifications_do_not_look_like_an_incomplete_checkout() {
-        if !git_available() {
-            eprintln!("跳过：没有 git");
-            return;
-        }
-
-        let root = temp_dir("modified");
-        let repo = root.join("repo");
-        init_repo(&repo);
-
-        fs::write(repo.join("Makefile"), "all:\n\t@echo changed\n").unwrap();
+        // 看起来“像”个完整仓库，但只要没有标记，一样重来
+        let looks_done = root.join("looks-done");
+        fs::create_dir_all(looks_done.join("cmd").join(".git")).unwrap();
+        fs::write(looks_done.join("cmd").join("Makefile"), "all:\n").unwrap();
         assert!(
-            has_complete_sources(&root),
-            "只是改了文件，仓库仍然是完整的"
+            !has_complete_sources(&looks_done),
+            "没有标记就不算完整，哪怕里面已经有 Makefile"
         );
+        assert_eq!(CloneState::decide(&looks_done, false), CloneState::ReClone);
+
+        // 有标记 → 直接复用
+        let done = root.join("done");
+        fs::create_dir_all(&done).unwrap();
+        fs::write(done.join(CLONE_MARKER), "").unwrap();
+        assert!(has_complete_sources(&done));
+        assert_eq!(CloneState::decide(&done, false), CloneState::Existing);
+
+        // 用户勾了「重新克隆」时优先级最高
+        assert_eq!(CloneState::decide(&done, true), CloneState::ReClone);
 
         let _ = fs::remove_dir_all(&root);
     }

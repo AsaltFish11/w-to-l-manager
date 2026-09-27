@@ -1,12 +1,16 @@
 {
     "lists" : [
         {
-            "id": "ChenPi11_cmd",
+            "id": "ChenPi11-cmd",
+            "author": "ChenPi11",
             "describe": "Windows cmd.exe 命令解释器在 Unix 上的忠实重实现。\n诞生于 GNU/Linux，可在所有的类 Unix 系统上运行。\n很遗憾，它不支持 Windows 平台，无法占领 Windows 市场。",
             "github-url": "https://github.com/ChenPi11/cmd",
-            "clone-command": "git clone https://github.com/ChenPi11/cmd.git",
+            "bilibili-url": "https://www.bilibili.com/video/BV1wkuH64EE8",
+            "platform": "",
+            "clone-command": "git clone --depth=1 https://github.com/ChenPi11/cmd.git",
             "dependency": [
-                "make"
+                "make",
+                "gcc"
             ],
             "install-commands": [
                 {
@@ -22,6 +26,48 @@
                 {
                     "permission": "root",
                     "command": "rm -f /usr/local/bin/cmd.exe /usr/local/bin/COMMAND.COM /usr/local/bin/cmd"
+                }
+            ]
+        },
+        {
+            "id": "macOS-Terminal-Explorer-for-Linux",
+            "author": "macOS-Terminal",
+            "describe": "在 Linux 上深度复刻 Windows 11 资源管理器的极客项目，还原其经典的“未响应”体验。\n注意：本项目包含崩溃接管与强制退出功能。默认配置不会破坏任何东西，但打开 EXPLORER_SESSION_KILL=1 后它会真的终止你的用户会话。只装在你自己的机器上， 装之前备份配置，并背下 Shift+F10。",
+            "github-url": "https://github.com/macOS-Terminal/Explorer-for-Linux",
+            "bilibili-url": "https://www.bilibili.com/video/BV1ZWgV68EtU",
+            "platform": "",
+            "clone-command": "git clone --depth=1 https://github.com/macOS-Terminal/Explorer-for-Linux.git",
+            "dependency": [
+                "cmake",
+                "make",
+                "gcc"
+            ],
+            "install-commands": [
+                {
+                    "permission": "normal",
+                    "command": "chmod +x ./scripts/install.sh"
+                },
+                {
+                    "permission": "normal",
+                    "command": "./scripts/install.sh"
+                }
+            ],
+            "uninstall-commands": [
+                {
+                    "permission": "normal",
+                    "command": "explorer-killall --session"
+                },
+                {
+                    "permission": "normal",
+                    "command": "rm -rf ~/.local/bin/{winlogin*,explorer*,crashguard*,explorer-killall*}"
+                },
+                {
+                    "permission": "normal",
+                    "command": "rm -rf ~/.config/explorer-linux"
+                },
+                {
+                    "permission": "normal",
+                    "command": "rm -f ~/.config/autostart/explorer-linux.desktop"
                 }
             ]
         }

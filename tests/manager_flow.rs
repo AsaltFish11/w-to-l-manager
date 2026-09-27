@@ -303,7 +303,12 @@ fn interrupted_clone_is_redone_on_the_next_install() {
     assert!(text.contains("cloned"), "应重新克隆：\n{text}");
     assert!(base.join("demo-cmd").join("where.txt").is_file());
 
-    // 这次真的克隆完了，下次才会跳过克隆
+    // 克隆成功后应写下完整性标记，下次才会跳过克隆
+    assert!(
+        base.join(source::CLONE_MARKER).is_file(),
+        "克隆成功后应写下 {} 标记",
+        source::CLONE_MARKER
+    );
     assert!(source::has_complete_sources(&base));
     assert_eq!(CloneState::decide(&base, false), CloneState::Existing);
 
@@ -534,57 +539,62 @@ fn wrong_sudo_password_fails_without_hanging() {
 fn the_projects_own_project_list_is_valid_and_actionable() {
     let path = paths::locate_project_list();
     assert!(path.is_file(), "应能找到 {}", path.display());
+    let root = path.parent().expect("配置文件应有父目录");
 
     let text = fs::read_to_string(&path).unwrap();
     let loaded = model::parse(&text).expect("项目根目录的 project_list.json 应能解析");
     assert!(!loaded.entries.is_empty(), "列表里应至少有一个条目");
 
-    let entry = loaded
-        .entries
-        .iter()
-        .find(|e| e.id == "ChenPi11_cmd")
-        .expect("应包含 ChenPi11_cmd 条目");
+    // 这个文件由维护者随时更新，所以只验证“每个条目都能被正确处理”，
+    // 不针对某个具体条目做断言。
+    for entry in &loaded.entries {
+        assert!(!entry.id.trim().is_empty(), "每个条目都应有 id");
+        assert!(
+            !entry.install_commands.is_empty(),
+            "{} 没有 install-commands，装不了",
+            entry.id
+        );
 
-    // 描述与 GitHub 链接都要能被读出来
-    assert!(!entry.describe.trim().is_empty());
-    assert!(
-        entry
-            .github_url
-            .as_deref()
-            .is_some_and(|u| u.starts_with("https://github.com/")),
-        "{:?}",
-        entry.github_url
-    );
-
-    // 克隆命令存在 → 安装时会克隆到项目专属目录
-    assert!(entry.needs_clone());
-    let root = Path::new("/tmp/proj");
-    let planned = steps::install_steps(root, entry, &[], None, CloneState::Fresh);
-    assert_eq!(
-        planned.source_dir(),
-        Some(Path::new("/tmp/proj/sources/ChenPi11_cmd"))
-    );
-
-    // 权限声明按 JSON 生效：uninstall-commands 标了 root
-    assert!(
-        entry
-            .uninstall_commands
-            .iter()
-            .any(|c| c.permission() == Permission::Root),
-        "{:?}",
-        entry.uninstall_commands
-    );
-    let planned =
-        steps::uninstall_steps(root, entry, &entry.uninstall_commands, &[], None, false);
-    assert!(planned.steps.iter().any(|s| s.needs_root));
-
-    // 仓库自带条目提供了 uninstall-commands，因此直接采用
-    match model::uninstall_plan(entry) {
-        UninstallSupport::Available(plan) => {
-            assert_eq!(plan.origin, UninstallOrigin::Author);
-            assert!(!plan.commands.is_empty());
+        let planned = steps::install_steps(root, entry, &[], None, CloneState::Fresh);
+        if entry.needs_clone() {
+            // 源码目录必须是本项目专属的 sources/<id>
+            let expected = paths::project_source_base(root, &entry.id);
+            assert_eq!(
+                planned.source_dir(),
+                Some(expected.as_path()),
+                "{} 的源码目录不对",
+                entry.id
+            );
+            // 克隆成功之后必须紧接着写下完整性标记：
+            // 下一次安装靠它判断能不能跳过克隆。
+            let marker_at = planned
+                .steps
+                .iter()
+                .position(|s| s.command.contains(source::CLONE_MARKER))
+                .unwrap_or_else(|| {
+                    panic!("{} 应该有写完整性标记的步骤", entry.id)
+                });
+            let clone_at = planned
+                .steps
+                .iter()
+                .position(|s| Some(&s.command) == entry.clone_command.as_ref())
+                .expect("应该有克隆步骤");
+            assert!(
+                clone_at < marker_at,
+                "{} 的完整性标记必须写在克隆之后",
+                entry.id
+            );
         }
-        other => panic!("ChenPi11_cmd 应可卸载，实际是 {other:?}"),
+
+        // 卸载：要么给出可执行命令，要么明确说明为什么不能卸载
+        match model::uninstall_plan(entry) {
+            UninstallSupport::Available(plan) => {
+                assert!(!plan.commands.is_empty(), "{} 的卸载计划是空的", entry.id);
+            }
+            UninstallSupport::Unavailable { reason } => {
+                assert!(!reason.is_empty(), "{} 应说明不能卸载的原因", entry.id);
+            }
+        }
     }
 }
 

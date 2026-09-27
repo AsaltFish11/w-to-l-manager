@@ -173,6 +173,7 @@ pub struct ManagerApp {
 impl ManagerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let font = fonts::install_cjk_font(&cc.egui_ctx);
+        apply_style(&cc.egui_ctx);
         let mut app = Self::build(paths::locate_project_list(), font);
 
         log::info!(
@@ -687,15 +688,7 @@ impl ManagerApp {
 
     fn top_bar(&mut self, ui: &mut Ui) {
         egui::Panel::top("w2l_top").show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(APP_TITLE).size(20.0).strong());
-                ui.label(
-                    RichText::new("读取 project_list.json，管理 Windows 移植软件的安装与卸载")
-                        .color(MUTED),
-                );
-            });
-            ui.add_space(6.0);
+            ui.add_space(10.0);
 
             // --- 数据源 ---
             ui.horizontal_wrapped(|ui| {
@@ -715,7 +708,8 @@ impl ManagerApp {
                 }
             });
 
-            ui.add_space(2.0);
+            // --- 状态 ---
+            ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 match &self.load_error {
                     Some(err) => {
@@ -735,6 +729,8 @@ impl ManagerApp {
                         );
                     }
                 }
+
+                status_divider(ui);
                 match self.manager {
                     Some(kind) => {
                         ui.label(
@@ -745,21 +741,24 @@ impl ManagerApp {
                     }
                     None => {
                         ui.label(
-                            RichText::new("未检测到 pacman / apt：缺失的依赖只能手动安装")
+                            RichText::new("未检测到 pacman / apt，缺失的依赖只能手动安装")
                                 .color(WARN_AMBER)
                                 .small(),
                         );
                     }
                 }
+
                 // 密码只在需要 root 时才问
+                status_divider(ui);
                 if self.is_root {
-                    ui.label(RichText::new("当前以 root 运行，无需密码").color(OK_GREEN).small());
+                    ui.label(RichText::new("以 root 运行，无需密码").color(OK_GREEN).small());
                 } else if self.sudo_password.is_empty() {
                     ui.label(
-                        RichText::new("提权密码：未保存（执行到需要 root 的步骤时才会询问）")
+                        RichText::new("提权密码：未保存")
                             .color(MUTED)
                             .small(),
-                    );
+                    )
+                    .on_hover_text("执行到需要 root 的步骤时才会询问，密码只留在内存里");
                 } else {
                     ui.label(RichText::new("提权密码：已保存在内存中").color(OK_GREEN).small());
                     if ui.small_button("清除").clicked() {
@@ -767,7 +766,9 @@ impl ManagerApp {
                         self.set_toast("已清除内存中的 sudo 密码".to_string(), ToastKind::Warn);
                     }
                 }
+
                 if let Some(warnings) = self.warnings.first() {
+                    status_divider(ui);
                     let extra = self.warnings.len().saturating_sub(1);
                     let text = if extra == 0 {
                         format!("⚠ {warnings}")
@@ -779,10 +780,11 @@ impl ManagerApp {
                 }
             });
 
-            ui.add_space(2.0);
+            // --- 工作目录 ---
+            ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("工作目录：");
-                let width = (ui.available_width() - 260.0).clamp(180.0, 460.0);
+                let width = (ui.available_width() - 140.0).clamp(180.0, 520.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.work_dir_input)
                         .desired_width(width)
@@ -791,30 +793,35 @@ impl ManagerApp {
                 if ui.small_button("用列表目录").clicked() {
                     self.work_dir_input = project_root_of(&self.list_path).display().to_string();
                 }
+            });
+
+            // --- 文件位置（次要信息，小字放一行）---
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
                 if let Some(path) = &self.state_file {
                     ui.label(
                         RichText::new(format!("状态文件：{}", path.display()))
                             .color(MUTED)
                             .small(),
-                    );
+                    )
+                    .on_hover_text("安装状态保存在这里");
                 }
                 match crate::logging::current_path() {
                     Some(path) => {
+                        status_divider(ui);
                         ui.label(
                             RichText::new(format!(
                                 "日志：{}（{} 级）",
-                                file_label(&path),
+                                path.display(),
                                 crate::logging::level_name(crate::logging::current_level())
                             ))
                             .color(MUTED)
                             .small(),
                         )
-                        .on_hover_text(format!(
-                            "{}\n\n设置 W2L_LOG=debug 可把命令原始输出也写进日志",
-                            path.display()
-                        ));
+                        .on_hover_text("设置 W2L_LOG=debug 可把命令原始输出也写进日志");
                     }
                     None => {
+                        status_divider(ui);
                         ui.label(RichText::new("日志：仅输出到 stderr").color(MUTED).small());
                     }
                 }
@@ -891,7 +898,12 @@ impl ManagerApp {
     fn project_card(&mut self, ui: &mut Ui, entry: &ProjectEntry) -> Option<Action> {
         let id = entry.id.clone();
         let describe = entry.describe.clone();
-        let github_url = entry.github_url.clone();
+        let author = entry.author().map(str::to_string);
+        let links: Vec<(&'static str, String)> = entry
+            .links()
+            .into_iter()
+            .map(|(icon, url)| (icon, url.to_string()))
+            .collect();
         let clone_command = entry.clone_command.clone();
         let source_base = entry
             .needs_clone()
@@ -965,13 +977,17 @@ impl ManagerApp {
         let mut action = None;
 
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(12, 10))
+            .inner_margin(egui::Margin::symmetric(14, 12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
 
                 // 标题行
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&id).size(17.0).strong());
+                    ui.label(RichText::new(&id).size(18.0).strong());
+                    if let Some(author) = &author {
+                        ui.label(RichText::new(format!("@{author}")).color(MUTED).small())
+                            .on_hover_text("作者 / 维护者");
+                    }
                     if installed {
                         let text = if installed_at > 0 {
                             format!("● 已安装 · {}", state::format_time(installed_at))
@@ -1011,7 +1027,7 @@ impl ManagerApp {
                     });
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(6.0);
 
                 // 说明
                 if describe.trim().is_empty() {
@@ -1024,13 +1040,21 @@ impl ManagerApp {
                     );
                 }
 
-                // 项目链接
-                if let Some(url) = &github_url {
-                    ui.add_space(3.0);
+                // 项目链接（GitHub / B 站等）
+                if !links.is_empty() {
+                    ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("项目主页：").color(MUTED).small());
-                        ui.hyperlink_to(RichText::new(format!("🔗 {url}")).color(INFO_BLUE), url)
-                            .on_hover_text("点击用系统浏览器打开");
+                        for (index, (icon, url)) in links.iter().enumerate() {
+                            if index > 0 {
+                                status_divider(ui);
+                            }
+                            ui.hyperlink_to(
+                                RichText::new(format!("{icon} {}", short_url(url)))
+                                    .color(INFO_BLUE),
+                                url,
+                            )
+                            .on_hover_text(format!("{url}\n点击用系统浏览器打开"));
+                        }
                     });
                 }
 
@@ -1750,18 +1774,22 @@ impl ManagerApp {
                 ui.monospace(format!("  源码目录：{base}"));
                 if sources_incomplete {
                     ui.label(
-                        RichText::new(
-                            "  该目录里的源码不完整（上次克隆可能失败或被取消），\n  \
-                             将先删除它再重新克隆，否则构建会在半个仓库里跑。",
-                        )
+                        RichText::new(format!(
+                            "  该目录里没有完整性标记（{}），说明上次克隆没跑完，\n  \
+                             将先删除整个目录再重新克隆 —— 否则构建会在半个仓库里跑。",
+                            source::CLONE_MARKER
+                        ))
                         .color(WARN_AMBER)
                         .small(),
                     );
                 } else if sources_complete {
                     ui.label(
-                        RichText::new("  该目录已有完整源码，默认跳过克隆")
-                            .color(OK_GREEN)
-                            .small(),
+                        RichText::new(format!(
+                            "  该目录已有完整源码（存在标记 {}），默认跳过克隆",
+                            source::CLONE_MARKER
+                        ))
+                        .color(OK_GREEN)
+                        .small(),
                     );
                     ui.checkbox(&mut re_clone, "重新克隆（先删除上面的目录）");
                 }
@@ -2037,18 +2065,24 @@ impl ManagerApp {
 
     fn help_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_help;
+        // 内容比屏幕高时必须能滚动，否则下面的说明根本看不到
+        let max_height = (ctx.content_rect().height() - 96.0).max(240.0);
         egui::Window::new("project_list.json 格式说明")
             .open(&mut open)
             .resizable(true)
-            .default_width(680.0)
+            .vscroll(true)
+            .default_size([660.0, 560.0])
+            .max_height(max_height)
             .show(ctx, |ui| {
                 ui.label("每个条目支持以下字段：");
                 ui.add_space(4.0);
                 ui.label(RichText::new("• id：唯一标识，显示为列表标题，也用作源码目录名").strong());
+                ui.label(RichText::new("• author：作者 / 维护者，显示在标题旁边").strong());
                 ui.label(RichText::new("• describe：说明文字，可包含换行").strong());
                 ui.label(
                     RichText::new("• github-url：项目链接，界面上显示成可点击的超链接").strong(),
                 );
+                ui.label(RichText::new("• bilibili-url：B 站视频链接，同样显示成超链接").strong());
                 ui.label(RichText::new("• clone-command：把源码克隆下来的命令").strong());
                 ui.label(
                     RichText::new("• dependency：依赖的命令名数组，会检查是否在 PATH 中").strong(),
@@ -2135,9 +2169,11 @@ impl ManagerApp {
 const HELP_SAMPLE: &str = r#"{
     "lists": [
         {
-            "id": "ChenPi11_cmd",
+            "id": "ChenPi11-cmd",
+            "author": "ChenPi11",
             "describe": "Windows cmd.exe 命令解释器在 Unix 上的忠实重实现。",
             "github-url": "https://github.com/ChenPi11/cmd",
+            "bilibili-url": "https://www.bilibili.com/video/BV1wkuH64EE8",
             "clone-command": "git clone https://github.com/ChenPi11/cmd.git",
             "dependency": ["make"],
             "install-commands": [
@@ -2150,6 +2186,55 @@ const HELP_SAMPLE: &str = r#"{
         }
     ]
 }"#;
+
+/// 链接的显示文本：去掉协议和 `www.`，看着短一点。
+///
+/// 打开链接用的仍是原始 URL，完整地址放在悬停提示里。
+fn short_url(url: &str) -> String {
+    let trimmed = url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.");
+    trimmed.trim_end_matches('/').to_string()
+}
+
+/// 状态行里用于分组的小竖线。
+fn status_divider(ui: &mut Ui) {
+    ui.label(RichText::new("│").color(MUTED).small());
+}
+
+/// 统一的字体与间距，让界面不至于挤在一起。
+fn apply_style(ctx: &egui::Context) {
+    use eframe::egui::{FontFamily, FontId, TextStyle};
+
+    // 亮色 / 暗色主题都改一遍
+    ctx.all_styles_mut(|style| {
+        style.text_styles = [
+            (
+                TextStyle::Heading,
+                FontId::new(21.0, FontFamily::Proportional),
+            ),
+            (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
+            (
+                TextStyle::Button,
+                FontId::new(15.0, FontFamily::Proportional),
+            ),
+            (TextStyle::Small, FontId::new(12.5, FontFamily::Proportional)),
+            (
+                TextStyle::Monospace,
+                FontId::new(14.0, FontFamily::Monospace),
+            ),
+        ]
+        .into();
+        // 松一点的行距和按钮内边距，读起来更舒服
+        style.spacing.item_spacing = egui::vec2(9.0, 7.0);
+        style.spacing.button_padding = egui::vec2(11.0, 5.0);
+        style.spacing.window_margin = egui::Margin::same(12);
+        style.spacing.indent = 18.0;
+        style.spacing.extra_text_line_spacing = 2.0;
+    });
+}
 
 /// 渲染一条带权限标注的命令。
 fn permission_line(ui: &mut Ui, index: usize, spec: &CommandSpec) {

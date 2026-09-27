@@ -164,12 +164,18 @@ impl Serialize for CommandSpec {
 pub struct ProjectEntry {
     /// 唯一标识，同时作为界面上的标题，也用作源码目录名。
     pub id: String,
+    /// 作者 / 维护者，显示在标题旁边。
+    #[serde(default)]
+    pub author: Option<String>,
     /// 说明文字，允许包含换行。
     #[serde(default)]
     pub describe: String,
     /// 项目主页 / GitHub 链接，界面上会显示成可点击的链接。
     #[serde(rename = "github-url", default)]
     pub github_url: Option<String>,
+    /// B 站视频链接（介绍 / 演示），界面上显示成可点击的超链接。
+    #[serde(rename = "bilibili-url", default)]
+    pub bilibili_url: Option<String>,
     /// 把源码克隆下来的命令；缺省表示不需要克隆，直接用「工作目录」。
     #[serde(rename = "clone-command", default)]
     pub clone_command: Option<String>,
@@ -191,6 +197,33 @@ impl ProjectEntry {
             .as_ref()
             .is_some_and(|command| !command.trim().is_empty())
     }
+
+    /// 作者（去掉首尾空白后非空才算）。
+    pub fn author(&self) -> Option<&str> {
+        self.author
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// 项目相关的外部链接：`(显示名, URL)`。
+    ///
+    /// 顺序固定，方便界面按统一顺序渲染。
+    pub fn links(&self) -> Vec<(&'static str, &str)> {
+        let mut out = Vec::new();
+        if let Some(url) = non_empty(self.github_url.as_deref()) {
+            out.push(("🔗", url));
+        }
+        if let Some(url) = non_empty(self.bilibili_url.as_deref()) {
+            out.push(("📺", url));
+        }
+        out
+    }
+}
+
+/// 去掉首尾空白，空串按 `None` 处理。
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
 }
 
 /// `project_list.json` 的顶层对象。
@@ -619,8 +652,10 @@ mod tests {
             "lists" : [
                 {
                     "id": "ChenPi11_cmd",
+                    "author": "ChenPi11",
                     "describe": "Windows cmd.exe 解释器",
                     "github-url": "https://github.com/ChenPi11/cmd",
+                    "bilibili-url": "https://www.bilibili.com/video/BV1wkuH64EE8",
                     "clone-command": "git clone https://github.com/ChenPi11/cmd.git",
                     "dependency": ["make"],
                     "install-commands": [
@@ -637,7 +672,12 @@ mod tests {
         assert_eq!(loaded.entries.len(), 1);
         let e = &loaded.entries[0];
         assert_eq!(e.id, "ChenPi11_cmd");
+        assert_eq!(e.author(), Some("ChenPi11"));
         assert_eq!(e.github_url.as_deref(), Some("https://github.com/ChenPi11/cmd"));
+        assert_eq!(
+            e.bilibili_url.as_deref(),
+            Some("https://www.bilibili.com/video/BV1wkuH64EE8")
+        );
         assert_eq!(
             e.clone_command.as_deref(),
             Some("git clone https://github.com/ChenPi11/cmd.git")
@@ -656,6 +696,38 @@ mod tests {
         );
         assert_eq!(e.uninstall_commands[0].permission(), Permission::Root);
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
+    #[test]
+    fn author_and_links_are_optional_and_trimmed() {
+        // 都没有时：author() 是 None，links() 是空的
+        let loaded = parse(r#"[{"id":"a","install-commands":["true"]}]"#).unwrap();
+        let entry = &loaded.entries[0];
+        assert_eq!(entry.author(), None);
+        assert!(entry.links().is_empty());
+
+        // 空串 / 空白串按“没写”处理，不会渲染出空链接
+        let loaded = parse(
+            r#"[{"id":"a","author":"  ","github-url":"","bilibili-url":"   ",
+                 "install-commands":["true"]}]"#,
+        )
+        .unwrap();
+        let entry = &loaded.entries[0];
+        assert_eq!(entry.author(), None);
+        assert!(entry.links().is_empty());
+
+        // 有值时按固定顺序给出（GitHub 在前，B 站在后），并去掉首尾空白
+        let loaded = parse(
+            r#"[{"id":"a","author":" ChenPi11 ","bilibili-url":" https://b.com/v ",
+                 "github-url":"https://g.com/x","install-commands":["true"]}]"#,
+        )
+        .unwrap();
+        let entry = &loaded.entries[0];
+        assert_eq!(entry.author(), Some("ChenPi11"));
+        assert_eq!(
+            entry.links(),
+            vec![("🔗", "https://g.com/x"), ("📺", "https://b.com/v")]
+        );
     }
 
     #[test]
