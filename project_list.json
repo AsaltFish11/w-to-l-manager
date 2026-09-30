@@ -6,7 +6,9 @@
             "describe": "Windows cmd.exe 命令解释器在 Unix 上的忠实重实现。\n诞生于 GNU/Linux，可在所有的类 Unix 系统上运行。\n很遗憾，它不支持 Windows 平台，无法占领 Windows 市场。",
             "github-url": "https://github.com/ChenPi11/cmd",
             "bilibili-url": "https://www.bilibili.com/video/BV1wkuH64EE8",
-            "platform": "",
+            "platform": [
+                "all-linux"
+            ],
             "clone-command": "git clone --depth=1 https://github.com/ChenPi11/cmd.git",
             "dependency": [
                 "make",
@@ -27,7 +29,18 @@
                     "permission": "root",
                     "command": "rm -f /usr/local/bin/cmd.exe /usr/local/bin/COMMAND.COM /usr/local/bin/cmd"
                 }
-            ]
+            ],
+            "button-1": {
+                "name": "运行",
+                "describe": "打开一个新的cmd",
+                "background": true,
+                "commands": [
+                    {
+                        "permission": "normal",
+                        "command": "cmd"
+                    }
+                ]
+            }
         },
         {
             "id": "Explorer-for-Linux",
@@ -35,7 +48,9 @@
             "describe": "在 Linux 上深度复刻 Windows 11 资源管理器的极客项目，还原其经典的“未响应”体验。\n注意：本项目包含崩溃接管与强制退出功能。默认配置不会破坏任何东西，但打开 EXPLORER_SESSION_KILL=1 后它会真的终止你的用户会话。只装在你自己的机器上， 装之前备份配置，并背下 Shift+F10。",
             "github-url": "https://github.com/macOS-Terminal/Explorer-for-Linux",
             "bilibili-url": "https://www.bilibili.com/video/BV1ZWgV68EtU",
-            "platform": "",
+            "platform": [
+                "all-linux"
+            ],
             "clone-command": "git clone --depth=1 https://github.com/macOS-Terminal/Explorer-for-Linux.git",
             "dependency": [
                 "cmake",
@@ -69,7 +84,80 @@
                     "permission": "normal",
                     "command": "rm -f ~/.config/autostart/explorer-linux.desktop"
                 }
-            ]
+            ],
+            "button-1": {
+                "name": "运行",
+                "describe": "打开一个新的资源管理器",
+                "background": true,
+                "commands": [
+                    {
+                        "permission": "normal",
+                        "command": "explorer.exe"
+                    }
+                ]
+            },
+            "button-2": {
+                "name": "终止",
+                "describe": "调用项目作者给出的强制终止指令",
+                "commands": [
+                    {
+                        "permission": "normal",
+                        "command": "explorer-killall --session"
+                    }
+                ]
+            },
+            "tips": "此项目提供更多进阶功能，具体请前往github查看，此处只安装最基础版本\n作者给出的逃生通道：\nShift+F10 - 强制清场（黑/白屏与正常状态均生效）\n 会话终结门控:export EXPLORER_SESSION_KILL=1 后 explorer-killall --session"
+        },
+        {
+            "id": "activate-linux",
+            "author": "MrGlockenspiel",
+            "describe": "将激活Windows水印移植到linux的一个项目",
+            "github-url": "https://github.com/MrGlockenspiel/activate-linux",
+            "platform": [
+                "all-linux"
+            ],
+            "clone-command": "git clone --depth=1 https://github.com/MrGlockenspiel/activate-linux.git",
+            "dependency": [
+                "gcc",
+                "make"
+            ],
+            "install-commands": [
+                {
+                    "permission": "normal",
+                    "command": "make"
+                },
+                {
+                    "permission": "root",
+                    "command": "make install"
+                }
+            ],
+            "uninstall-commands": [
+                {
+                    "permission": "root",
+                    "command": "make uninstall"
+                }
+            ],
+            "button-1": {
+                "name": "启动",
+                "describe": "启动水印",
+                "background": true,
+                "commands": [
+                    {
+                        "permission": "normal",
+                        "command": "activate-linux"
+                    }
+                ]
+            },
+            "button-2": {
+                "name": "关闭",
+                "describe": "终止水印进程",
+                "commands": [
+                    {
+                        "permission": "normal",
+                        "command": "pkill -f activate-linux"
+                    }
+                ]
+            }
         }
     ]
 }

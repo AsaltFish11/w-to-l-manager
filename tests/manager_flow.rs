@@ -732,6 +732,69 @@ fn update_keeps_unrelated_files_in_the_tmp_dir() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// 点 button-N：命令在项目源码目录里执行。
+#[test]
+fn button_commands_run_in_the_project_source_directory() {
+    let root = temp_dir("button-run");
+    let base = paths::project_source_base(&root, "demo");
+    fs::create_dir_all(&base).unwrap();
+
+    let entry = ProjectEntry {
+        id: "demo".to_string(),
+        clone_command: Some("true".to_string()),
+        ..Default::default()
+    };
+    let button = model::ActionButton {
+        name: "运行".to_string(),
+        describe: "跑一下".to_string(),
+        commands: vec![CommandSpec::normal("echo button-ran > marker.txt")],
+        background: false,
+    };
+
+    let plan = steps::action_steps(&root, &entry, &button);
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.source_dir(), Some(base.as_path()));
+
+    let _ = run_plan("demo", JobKind::Action, plan, &root);
+
+    assert!(
+        base.join("marker.txt").is_file(),
+        "按钮的命令应该在 sources/demo 里执行"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// 不需要克隆的项目，按钮命令在工作目录里执行。
+#[test]
+fn buttons_of_projects_without_clone_run_in_the_work_dir() {
+    let root = temp_dir("button-noclone");
+    fs::create_dir_all(&root).unwrap();
+    let work = temp_dir("button-work");
+    fs::create_dir_all(&work).unwrap();
+
+    let entry = ProjectEntry {
+        id: "demo".to_string(),
+        ..Default::default()
+    };
+    let button = model::ActionButton {
+        name: "运行".to_string(),
+        describe: String::new(),
+        commands: vec![CommandSpec::normal("echo no-clone > marker.txt")],
+        background: false,
+    };
+
+    let plan = steps::action_steps(&root, &entry, &button);
+    assert!(plan.source_base.is_none(), "没有 clone-command 就不该有源码目录");
+
+    let _ = run_plan("demo", JobKind::Action, plan, &work);
+
+    assert!(work.join("marker.txt").is_file(), "应该落在工作目录里");
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&work);
+}
+
 /// 设置里配的环境变量要真的出现在每条命令的环境里（值里有空格也要正确引用）。
 #[test]
 fn configured_environment_variables_reach_every_command() {
@@ -797,3 +860,5 @@ fn dependency_plan_explains_what_it_can_and_cannot_install() {
     let reason = plan.missing[0].reason.clone().unwrap_or_default();
     assert!(reason.contains("手动安装"), "{reason}");
 }
+
+

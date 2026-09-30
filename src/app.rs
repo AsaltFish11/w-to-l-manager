@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::deps::{self, DepPlan, PackageManagerKind};
 use crate::exec::{Console, Job, JobKind, JobOutcome, JobRequest, LogLine, LogStream, StepStatus};
 use crate::fonts::{self, LoadedFont};
-use crate::model::{self, CommandSpec, ProjectEntry, UninstallSupport};
+use crate::model::{self, ActionButton, CommandSpec, Permission, ProjectEntry, UninstallSupport};
 use crate::paths;
 use crate::source::{self, CloneState};
 use crate::state::{self, AutoDep, DepRecord, ManagerState};
@@ -25,6 +25,10 @@ const WARN_AMBER: Color32 = Color32::from_rgb(0xd9, 0x8b, 0x1f);
 const ERR_RED: Color32 = Color32::from_rgb(0xd4, 0x3b, 0x3b);
 const INFO_BLUE: Color32 = Color32::from_rgb(0x5b, 0x9b, 0xd5);
 const MUTED: Color32 = Color32::from_rgb(0x8c, 0x8c, 0x8c);
+/// 平台上标签的底色。
+const PLATFORM_BG: Color32 = Color32::from_rgb(0x2c, 0x3a, 0x48);
+/// 提示框的底色。
+const TIPS_BG: Color32 = Color32::from_rgb(0x33, 0x2c, 0x1e);
 
 /// 自动重载检查文件变化的间隔。
 const AUTO_RELOAD_INTERVAL: Duration = Duration::from_millis(800);
@@ -91,6 +95,16 @@ enum Dialog {
         /// 源码目录已存在时，是否删掉重新克隆
         re_clone: bool,
     },
+    /// 确认执行 `button-N` 里的命令。
+    ConfirmAction {
+        project_id: String,
+        /// 按钮文字，用作标题
+        label: String,
+        describe: String,
+        commands: Vec<CommandSpec>,
+        /// 放到后台跑，不占用界面
+        background: bool,
+    },
     /// 确认卸载。
     ConfirmUninstall {
         project_id: String,
@@ -113,6 +127,22 @@ struct ActiveMeta {
     source_dir: Option<String>,
 }
 
+/// 一个放进后台跑的任务（`button` 的 `background: true`）。
+///
+/// 它不占用 `job` 那个唯一的任务位，所以界面不会被卡住，
+/// 别的安装/卸载照样能开；只在开始和结束时各提示一句。
+struct BackgroundJob {
+    job: Job,
+    project_id: String,
+    label: String,
+}
+
+/// 谁在等 sudo 密码。
+enum PasswordOwner {
+    Main,
+    Background(usize),
+}
+
 /// 卡片上产生的操作。
 ///
 /// 刻意把条目本身带上，而不是只带 id：`central()` 渲染时会临时把
@@ -120,6 +150,8 @@ struct ActiveMeta {
 enum Action {
     Install(Box<ProjectEntry>),
     Uninstall(Box<ProjectEntry>),
+    /// 点击条目里的 `button-N`（带下标，避免克隆一份按钮）。
+    RunButton(Box<ProjectEntry>, usize),
 }
 
 pub struct ManagerApp {
@@ -163,6 +195,8 @@ pub struct ManagerApp {
 
     /// 当前这个更新任务是不是启动时自动发起的（失败时不弹刺眼的错误）。
     update_automatic: bool,
+    /// 正在后台跑的任务（不占用主任务位）。
+    background: Vec<BackgroundJob>,
 
     // ---- 密码弹窗 ----
     /// 已经为哪个请求弹过窗（用于自动聚焦输入框）。
@@ -241,6 +275,7 @@ impl ManagerApp {
             active_meta: None,
             log_follow: true,
             update_automatic: false,
+            background: Vec::new(),
             password_prompt: None,
             password_input: String::new(),
             dialog: None,
@@ -484,6 +519,10 @@ impl ManagerApp {
                         self.update_automatic = false;
                         self.apply_update();
                     }
+                    // 按钮只是跑命令，不动安装状态
+                    JobKind::Action => {
+                        self.set_toast(format!("{project_id} 执行完成"), ToastKind::Ok);
+                    }
                 }
             }
             JobOutcome::Failed if kind == JobKind::Update && self.update_automatic => {
@@ -654,6 +693,13 @@ impl ManagerApp {
         );
     }
 
+    /// 每帧要做的事（和绘制无关），抽出来是为了能脱离 egui 测。
+    fn tick(&mut self) {
+        self.tick_auto_reload();
+        self.poll_job();
+        self.poll_background_jobs();
+    }
+
     /// 当前有没有正在跑的任务。
     fn busy(&self) -> bool {
         self.job.as_ref().is_some_and(|j| j.is_running())
@@ -772,6 +818,7 @@ impl ManagerApp {
         match action {
             Action::Install(entry) => self.begin_install(&entry),
             Action::Uninstall(entry) => self.begin_uninstall(&entry),
+            Action::RunButton(entry, index) => self.begin_action(&entry, index),
         }
     }
 
@@ -825,6 +872,182 @@ impl ManagerApp {
     }
 
     /// 点击「卸载」：算出卸载命令，并查出可选移除的自动安装依赖。
+    /// 点击了条目里的一个操作按钮：先让用户确认要跑的命令。
+    fn begin_action(&mut self, entry: &ProjectEntry, index: usize) {
+        let Some(button) = entry.buttons.get(index) else {
+            log::warn!("{} 上不存在第 {} 个 button", entry.id, index + 1);
+            return;
+        };
+        if button.commands.is_empty() {
+            self.set_toast(
+                format!("「{}」没有配置任何命令", button.label()),
+                ToastKind::Warn,
+            );
+            return;
+        }
+
+        log::info!(
+            "点击按钮：{} 的「{}」（{} 条命令）",
+            entry.id,
+            button.label(),
+            button.commands.len()
+        );
+        self.dialog = Some(Dialog::ConfirmAction {
+            project_id: entry.id.clone(),
+            label: button.label().to_string(),
+            describe: button.describe.trim().to_string(),
+            commands: button.commands.clone(),
+            background: button.background,
+        });
+    }
+
+    /// 用户确认后真正开始执行按钮里的命令。
+    fn start_action_job(
+        &mut self,
+        project_id: &str,
+        label: &str,
+        commands: &[CommandSpec],
+        background: bool,
+    ) {
+        let Some(entry) = self.entries.iter().find(|e| e.id == project_id).cloned() else {
+            self.set_toast(
+                format!("列表里已经找不到 {project_id} 了，可能刚被更新过"),
+                ToastKind::Warn,
+            );
+            return;
+        };
+        let button = ActionButton {
+            name: label.to_string(),
+            describe: String::new(),
+            commands: commands.to_vec(),
+            background,
+        };
+        let plan = steps::action_steps(&self.project_root, &entry, &button);
+        if plan.steps.is_empty() {
+            self.set_toast("这个按钮没有任何命令".to_string(), ToastKind::Warn);
+            return;
+        }
+
+        // 有源码目录就在里面跑，否则用工作目录
+        let work_dir = plan
+            .source_dir()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| paths::resolve_input_path(&self.work_dir_input));
+
+        let job = Job::spawn(JobRequest {
+            project_id: project_id.to_string(),
+            kind: JobKind::Action,
+            steps: plan.steps,
+            work_dir,
+            sudo_password: self.job_password(),
+            source_base: plan.source_base,
+            env: self.state.usable_env(),
+            console: self.console.clone(),
+        });
+
+        if background {
+            // 后台任务不占用主任务位：界面照常能用，别的安装/卸载也能开
+            self.console.push(LogLine {
+                job_id: 0,
+                project_id: project_id.to_string(),
+                step: 0,
+                stream: LogStream::Info,
+                text: format!(
+                    "▶ 「{label}」已在后台启动（{project_id}）—— 结束后会再提示一句"
+                ),
+            });
+            log::info!("后台启动「{label}」（{project_id}）");
+            self.background.push(BackgroundJob {
+                job,
+                project_id: project_id.to_string(),
+                label: label.to_string(),
+            });
+            self.log_follow = true;
+            return;
+        }
+
+        self.console.push(LogLine {
+            job_id: 0,
+            project_id: project_id.to_string(),
+            step: 0,
+            stream: LogStream::Info,
+            text: format!("──────── {}「{label}」────────", JobKind::Action.gerund()),
+        });
+        log::info!("开始执行「{label}」（{project_id}）");
+
+        self.active_meta = Some(ActiveMeta {
+            project_id: project_id.to_string(),
+            kind: JobKind::Action,
+            dep_record: DepRecord::default(),
+            source_dir: None,
+        });
+        self.job = Some(job);
+        self.job_handled = false;
+        self.toast = None;
+        self.log_follow = true;
+    }
+
+    /// 检查后台任务有没有跑完；结束了就提示一句并把它移出列表。
+    fn poll_background_jobs(&mut self) {
+        let mut done: Vec<usize> = Vec::new();
+
+        for (index, task) in self.background.iter().enumerate() {
+            if task.job.is_running() {
+                continue;
+            }
+
+            let (outcome, message, started_at, finished_at) = {
+                let guard = task.job.lock();
+                (
+                    guard.outcome,
+                    guard.message.clone(),
+                    guard.started_at,
+                    guard.finished_at,
+                )
+            };
+            let secs = finished_at.unwrap_or_else(state::now_secs).saturating_sub(started_at);
+            // 秒级时间戳，跑得比 1 秒还快就不提耗时了，免得写成“耗时 0 秒”
+            let elapsed = if secs >= 1 {
+                format!("（耗时 {}）", short_duration(secs))
+            } else {
+                String::new()
+            };
+            let text = if outcome == JobOutcome::Succeeded {
+                format!("■ 「{}」后台任务已结束{elapsed}", task.label)
+            } else if outcome == JobOutcome::Cancelled {
+                format!("■ 「{}」后台任务已取消{elapsed}", task.label)
+            } else {
+                format!(
+                    "■ 「{}」后台任务结束，但有命令失败{elapsed}：{message}",
+                    task.label
+                )
+            };
+
+            log::info!(
+                "后台任务「{}」（{}）结束：{outcome:?}，耗时 {secs} 秒",
+                task.label,
+                task.project_id
+            );
+            self.console.push(LogLine {
+                job_id: 0,
+                project_id: task.project_id.clone(),
+                step: 0,
+                stream: LogStream::Info,
+                text,
+            });
+            done.push(index);
+        }
+
+        // 从后往前删，下标才不会串
+        for index in done.into_iter().rev() {
+            let task = self.background.remove(index);
+            self.set_toast(
+                format!("「{}」后台任务已结束", task.label),
+                ToastKind::Ok,
+            );
+        }
+    }
+
     fn begin_uninstall(&mut self, entry: &ProjectEntry) {
         let plan = match model::uninstall_plan(entry) {
             UninstallSupport::Available(plan) => plan,
@@ -955,6 +1178,26 @@ impl ManagerApp {
                                 .small(),
                         );
                     }
+                }
+
+                // 后台任务不占任务位，但得让人知道还有东西在跑
+                if !self.background.is_empty() {
+                    status_divider(ui);
+                    let labels: Vec<&str> = self
+                        .background
+                        .iter()
+                        .map(|task| task.label.as_str())
+                        .collect();
+                    ui.label(
+                        RichText::new(format!(
+                            "后台任务 {} 个：{}",
+                            labels.len(),
+                            labels.join("、")
+                        ))
+                        .color(INFO_BLUE)
+                        .small(),
+                    )
+                    .on_hover_text("后台任务不占用任务位，界面可以照常使用；结束后会在日志里提示");
                 }
 
                 // 密码只在需要 root 时才问
@@ -1100,6 +1343,13 @@ impl ManagerApp {
         let id = entry.id.clone();
         let describe = entry.describe.clone();
         let author = entry.author().map(str::to_string);
+        let platforms: Vec<String> = entry.platforms().iter().map(|p| p.to_string()).collect();
+        let tips = entry.tips().map(str::to_string);
+        let buttons: Vec<(String, String)> = entry
+            .buttons
+            .iter()
+            .map(|b| (b.label().to_string(), b.describe.trim().to_string()))
+            .collect();
         let links: Vec<(&'static str, String)> = entry
             .links()
             .into_iter()
@@ -1181,6 +1431,15 @@ impl ManagerApp {
                         ui.label(RichText::new(format!("@{author}")).color(MUTED).small())
                             .on_hover_text("作者 / 维护者");
                     }
+                    for platform in &platforms {
+                        ui.label(
+                            RichText::new(platform)
+                                .color(INFO_BLUE)
+                                .small()
+                                .background_color(PLATFORM_BG),
+                        )
+                        .on_hover_text("适用平台");
+                    }
                     if installed {
                         let text = if installed_at > 0 {
                             format!("● 已安装 · {}", state::format_time(installed_at))
@@ -1217,6 +1476,26 @@ impl ManagerApp {
                         if !install_enabled && !install_tooltip.is_empty() {
                             let _ = response.on_disabled_hover_text(install_tooltip.clone());
                         }
+
+                        // 作者在 JSON 里定义的 button-1、button-2 …（倒序添加才是正序显示）
+                        for index in (0..buttons.len()).rev() {
+                            let (label, describe) = &buttons[index];
+                            // 忙的时候谁都别点，免得任务互相打架
+                            let enabled = !busy_here && !job_running;
+                            let response =
+                                ui.add_enabled(enabled, egui::Button::new(label.clone()));
+                            let response = if describe.is_empty() {
+                                response
+                            } else {
+                                response.on_hover_text(describe.clone())
+                            };
+                            if response.clicked() {
+                                action = Some(Action::RunButton(Box::new(entry.clone()), index));
+                            }
+                        }
+                        if !buttons.is_empty() {
+                            status_divider(ui);
+                        }
                     });
                 });
 
@@ -1231,6 +1510,23 @@ impl ManagerApp {
                             .wrap()
                             .selectable(true),
                     );
+                }
+
+                // 作者的额外提示（往往是重要的安全说明，别折叠）
+                if let Some(tips) = &tips {
+                    ui.add_space(6.0);
+                    egui::Frame::group(ui.style())
+                        .fill(TIPS_BG)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new("提示").color(WARN_AMBER).small().strong());
+                            ui.add(
+                                egui::Label::new(RichText::new(tips).small())
+                                    .wrap()
+                                    .selectable(true),
+                            );
+                        });
                 }
 
                 // 项目链接（GitHub / B 站等）
@@ -1414,6 +1710,13 @@ impl ManagerApp {
                 // 标题栏：当前任务信息 + 控制按钮
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("运行日志").strong());
+                    if !self.background.is_empty() {
+                        ui.label(
+                            RichText::new(format!("· 后台 {} 个", self.background.len()))
+                                .color(INFO_BLUE)
+                                .small(),
+                        );
+                    }
                     match &self.job {
                         Some(job) => {
                             let guard = job.lock();
@@ -1545,9 +1848,38 @@ impl ManagerApp {
         }
     }
 
+    /// 哪个任务在等 sudo 密码（主任务优先）。
+    fn password_owner(&self) -> Option<PasswordOwner> {
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|job| job.password_request().is_some())
+        {
+            return Some(PasswordOwner::Main);
+        }
+        self.background
+            .iter()
+            .position(|task| task.job.password_request().is_some())
+            .map(PasswordOwner::Background)
+    }
+
+    /// 按 `PasswordOwner` 取出对应的任务。
+    fn job_for(&self, owner: &PasswordOwner) -> Option<&Job> {
+        match owner {
+            PasswordOwner::Main => self.job.as_ref(),
+            PasswordOwner::Background(index) => self.background.get(*index).map(|t| &t.job),
+        }
+    }
+
     /// 需要 root 权限时才出现的密码输入框。
     fn password_modal(&mut self, ctx: &egui::Context) {
-        let request = self.job.as_ref().and_then(|job| job.password_request());
+        let Some(owner) = self.password_owner() else {
+            self.password_prompt = None;
+            return;
+        };
+        let request = self
+            .job_for(&owner)
+            .and_then(|job| job.password_request());
         let Some((step, command)) = request else {
             self.password_prompt = None;
             return;
@@ -1622,10 +1954,10 @@ impl ManagerApp {
             // 缓存在内存里，后面的步骤和任务就不用再问了
             log::info!("已提交 sudo 密码（只保存在内存中）");
             self.sudo_password = self.password_input.clone();
-            if let Some(job) = &self.job {
+            if let Some(job) = self.job_for(&owner) {
                 job.supply_password(self.sudo_password.clone());
             }
-        } else if cancel && let Some(job) = &self.job {
+        } else if cancel && let Some(job) = self.job_for(&owner) {
             log::warn!("用户取消输入 sudo 密码");
             job.decline_password();
         }
@@ -1657,6 +1989,13 @@ impl ManagerApp {
                 dep_record,
                 re_clone,
             ),
+            Dialog::ConfirmAction {
+                project_id,
+                label,
+                describe,
+                commands,
+                background,
+            } => self.confirm_action_dialog(ctx, project_id, label, describe, commands, background),
             Dialog::ConfirmUninstall {
                 project_id,
                 commands,
@@ -1895,6 +2234,93 @@ impl ManagerApp {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// 确认执行按钮里的命令。
+    fn confirm_action_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        project_id: String,
+        label: String,
+        describe: String,
+        commands: Vec<CommandSpec>,
+        background: bool,
+    ) -> Option<Dialog> {
+        let mut close = false;
+        let mut confirmed = false;
+
+        let root_needed = commands.iter().any(|c| c.permission() == Permission::Root);
+
+        egui::Modal::new(egui::Id::new("w2l_confirm_action")).show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.heading(format!("执行「{label}」"));
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("项目：{project_id}"))
+                    .color(MUTED)
+                    .small(),
+            );
+            if !describe.is_empty() {
+                ui.add_space(4.0);
+                ui.label(&describe);
+            }
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("将要依次执行：").strong());
+            for (index, spec) in commands.iter().enumerate() {
+                permission_line(ui, index + 1, spec);
+            }
+
+            if root_needed {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("其中包含需要 root 权限的命令，执行前会先要 sudo 密码。")
+                        .color(WARN_AMBER)
+                        .small(),
+                );
+            }
+            ui.add_space(4.0);
+            if background {
+                ui.label(
+                    RichText::new(
+                        "这个按钮在后台运行：点「执行」后立刻返回，不占用界面，\
+                         只在开始和结束时各提示一句。",
+                    )
+                    .color(INFO_BLUE)
+                    .small(),
+                );
+            }
+            ui.label(
+                RichText::new("这些命令由 project_list.json 的作者提供，执行前请确认内容。")
+                    .color(MUTED)
+                    .small(),
+            );
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("执行").clicked() {
+                    confirmed = true;
+                }
+                if ui.button("取消").clicked() {
+                    close = true;
+                }
+            });
+        });
+
+        if confirmed {
+            self.start_action_job(&project_id, &label, &commands, background);
+            return None;
+        }
+        if close {
+            return None;
+        }
+        Some(Dialog::ConfirmAction {
+            project_id,
+            label,
+            describe,
+            commands,
+            background,
+        })
+    }
+
     fn confirm_install_dialog(
         &mut self,
         ctx: &egui::Context,
@@ -2408,6 +2834,10 @@ impl ManagerApp {
                     RichText::new("• github-url：项目链接，界面上显示成可点击的超链接").strong(),
                 );
                 ui.label(RichText::new("• bilibili-url：B 站视频链接，同样显示成超链接").strong());
+                ui.label(
+                    RichText::new("• platform：适用平台数组，如 [\"all-linux\"]，显示成小标签").strong(),
+                );
+                ui.label(RichText::new("• tips：额外提示（可多行），显示成醒目的提示框").strong());
                 ui.label(RichText::new("• clone-command：把源码克隆下来的命令").strong());
                 ui.label(
                     RichText::new("• dependency：依赖的命令名数组，会检查是否在 PATH 中").strong(),
@@ -2418,12 +2848,21 @@ impl ManagerApp {
                         .strong()
                         .color(OK_GREEN),
                 );
+                ui.label(
+                    RichText::new(
+                        "• button-1 / button-2 / …：操作按钮，数字任意大小都认；\
+                         每项含 name（按钮文字）、describe（悬停说明）、commands（点击后执行的命令数组）、\
+                         background（可选，true 表示放后台跑，不占用界面）",
+                    )
+                    .strong()
+                    .color(INFO_BLUE),
+                );
                 ui.add_space(6.0);
                 ui.label("命令的两种写法（permission 缺省为 normal）：");
                 ui.add(
                     egui::TextEdit::multiline(&mut self.help_sample)
                         .code_editor()
-                        .desired_rows(11)
+                        .desired_rows(20)
                         .desired_width(f32::INFINITY),
                 );
 
@@ -2500,7 +2939,9 @@ const HELP_SAMPLE: &str = r#"{
             "describe": "Windows cmd.exe 命令解释器在 Unix 上的忠实重实现。",
             "github-url": "https://github.com/ChenPi11/cmd",
             "bilibili-url": "https://www.bilibili.com/video/BV1wkuH64EE8",
-            "clone-command": "git clone https://github.com/ChenPi11/cmd.git",
+            "platform": ["all-linux"],
+            "tips": "作者留的额外说明，会显示成提示框",
+            "clone-command": "git clone --depth=1 https://github.com/ChenPi11/cmd.git",
             "dependency": ["make"],
             "install-commands": [
                 { "permission": "normal", "command": "make" },
@@ -2508,7 +2949,14 @@ const HELP_SAMPLE: &str = r#"{
             ],
             "uninstall-commands": [
                 { "permission": "root", "command": "rm -f /usr/local/bin/cmd" }
-            ]
+            ],
+            "button-1": {
+                "name": "运行",
+                "describe": "打开一个新的 cmd",
+                "background": true,
+                "commands": [ { "permission": "normal", "command": "cmd" } ]
+            },
+            "button-2": { "name": "终止", "commands": [ "pkill -f cmd" ] }
         }
     ]
 }"#;
@@ -2629,14 +3077,9 @@ impl eframe::App for ManagerApp {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::R)) {
             self.reload();
         }
-        self.tick_auto_reload();
-        self.poll_job();
+        self.tick();
         // 任务在等密码时要立刻重绘
-        if self
-            .job
-            .as_ref()
-            .is_some_and(|j| j.password_request().is_some())
-        {
+        if self.password_owner().is_some() {
             ctx.request_repaint();
         }
     }
@@ -2656,6 +3099,10 @@ impl eframe::App for ManagerApp {
 
         if self.busy() {
             ctx.request_repaint_after(Duration::from_millis(120));
+        } else if !self.background.is_empty() {
+            // 后台任务可能要跑很久（比如启动一个 GUI 程序），
+            // 只是为了让结束时能被发现，不必刷太勤。
+            ctx.request_repaint_after(Duration::from_millis(800));
         } else if self.auto_reload {
             ctx.request_repaint_after(AUTO_RELOAD_INTERVAL);
         }
@@ -2880,6 +3327,115 @@ mod tests {
 
 
     /// 关掉「启动自动更新」后不该发起任何任务（也就不会联网）。
+    /// 后台按钮：不占任务位、不卡界面，结束后提示一句。
+    #[test]
+    fn background_buttons_do_not_block_the_interface() {
+        let (mut app, dir) = setup("background", ONE_ENTRY);
+
+        app.start_action_job(
+            "demo",
+            "启动",
+            &[CommandSpec::normal("sleep 3")],
+            true,
+        );
+
+        // 关键：主任务位是空的，界面照常能用
+        assert!(app.job.is_none(), "后台任务不该占用主任务位");
+        assert!(!app.busy(), "界面不该被卡住");
+        assert_eq!(app.background.len(), 1);
+        assert!(app.dialog.is_none(), "后台任务不该弹出挡界面的对话框");
+
+        // 这时候还能开别的任务（比如点安装）—— 只检查不会被 busy 拦下
+        assert!(!app.busy());
+
+        // 等它结束：走真实的每帧 tick()，而不是直接调内部函数
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !app.background.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "后台任务没能在 15 秒内结束"
+            );
+            app.tick();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(app.background.is_empty(), "结束后应该移出后台列表");
+        let toast = app.toast.as_ref().expect("结束时应提示一句");
+        assert!(toast.text.contains("后台任务已结束"), "{}", toast.text);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 前台按钮仍然占用任务位（行为和以前一样）。
+    #[test]
+    fn foreground_buttons_still_occupy_the_job_slot() {
+        let (mut app, dir) = setup("foreground", ONE_ENTRY);
+
+        app.start_action_job("demo", "运行", &[CommandSpec::normal("sleep 3")], false);
+
+        assert!(app.job.is_some(), "前台按钮应该占用主任务位");
+        assert!(app.busy());
+        assert!(app.background.is_empty());
+
+        if let Some(job) = &app.job {
+            job.cancel();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const BACKGROUND_ENTRY: &str = r#"{
+        "lists": [
+            {
+                "id": "bg-demo",
+                "github-url": "https://github.com/example/bg",
+                "install-commands": [ { "permission": "normal", "command": "make install" } ],
+                "button-1": {
+                    "name": "启动",
+                    "describe": "后台跑",
+                    "background": true,
+                    "commands": [ "sleep 1" ]
+                },
+                "button-2": { "name": "停止", "commands": [ "true" ] }
+            }
+        ]
+    }"#;
+
+    /// JSON 里的 background 要一路传到确认框（再由它决定怎么起任务）。
+    #[test]
+    fn background_flag_flows_from_json_into_the_confirm_dialog() {
+        let (mut app, dir) = setup("bg-dialog", BACKGROUND_ENTRY);
+        let entry = app.entries[0].clone();
+        assert_eq!(entry.buttons.len(), 2);
+        assert!(entry.buttons[0].background);
+        assert!(!entry.buttons[1].background, "没写 background 就是前台");
+
+        app.begin_action(&entry, 0);
+        match app.dialog.as_ref() {
+            Some(Dialog::ConfirmAction {
+                background,
+                label,
+                commands,
+                ..
+            }) => {
+                assert!(*background, "确认框要带上后台标记");
+                assert_eq!(label, "启动");
+                assert_eq!(commands.len(), 1);
+            }
+            _ => panic!("应该弹出确认框"),
+        }
+
+        app.dialog = None;
+        app.begin_action(&entry, 1);
+        match app.dialog.as_ref() {
+            Some(Dialog::ConfirmAction { background, .. }) => {
+                assert!(!*background, "停止按钮仍是前台执行")
+            }
+            _ => panic!("应该弹出确认框"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn auto_update_is_skipped_when_disabled() {
         let (mut app, dir) = setup("auto-off", ONE_ENTRY);

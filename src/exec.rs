@@ -30,6 +30,8 @@ pub enum JobKind {
     Uninstall,
     /// 拉取最新的 project_list.json（克隆配置仓库）。
     Update,
+    /// 点击条目里的 `button-N` 执行的操作命令。
+    Action,
 }
 
 impl JobKind {
@@ -38,6 +40,7 @@ impl JobKind {
             JobKind::Install => "安装",
             JobKind::Uninstall => "卸载",
             JobKind::Update => "更新列表",
+            JobKind::Action => "操作",
         }
     }
 
@@ -47,6 +50,7 @@ impl JobKind {
             JobKind::Install => "正在安装",
             JobKind::Uninstall => "正在卸载",
             JobKind::Update => "正在更新列表",
+            JobKind::Action => "正在执行",
         }
     }
 
@@ -55,7 +59,13 @@ impl JobKind {
             JobKind::Install => "安装",
             JobKind::Uninstall => "卸载",
             JobKind::Update => "更新列表",
+            JobKind::Action => "操作",
         }
+    }
+
+    /// 会不会改动安装状态（只有安装/卸载会）。
+    pub fn changes_install_state(self) -> bool {
+        matches!(self, JobKind::Install | JobKind::Uninstall)
     }
 }
 

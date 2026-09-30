@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::deps::PackageManagerKind;
 use crate::exec::JobStep;
-use crate::model::{self, CommandSpec, ProjectEntry};
+use crate::model::{self, ActionButton, CommandSpec, ProjectEntry};
 use crate::paths;
 use crate::source::{self, CloneState};
 
@@ -169,6 +169,22 @@ pub fn uninstall_steps(
         steps,
         source_base,
     }
+}
+
+/// 组装「点击 `button-N`」要执行的步骤：在项目源码目录里依次跑它自己的命令。
+pub fn action_steps(project_root: &Path, entry: &ProjectEntry, button: &ActionButton) -> PlannedJob {
+    // 需要克隆的项目，命令在仓库根目录里跑；否则用工作目录
+    let source_base = entry
+        .needs_clone()
+        .then(|| paths::project_source_base(project_root, &entry.id));
+
+    let steps = button
+        .commands
+        .iter()
+        .map(|spec| project_step(spec, source_base.is_some()))
+        .collect();
+
+    PlannedJob { steps, source_base }
 }
 
 /// 把 JSON 里的命令声明变成一步任务：权限照搬，有源码目录时在源码根目录里执行。

@@ -176,6 +176,17 @@ pub struct ProjectEntry {
     /// B 站视频链接（介绍 / 演示），界面上显示成可点击的超链接。
     #[serde(rename = "bilibili-url", default)]
     pub bilibili_url: Option<String>,
+    /// 适用平台，比如 `["all-linux"]`；空数组表示没写。
+    #[serde(default)]
+    pub platform: Vec<String>,
+    /// 额外提示（可多行），显示在说明下方。
+    #[serde(default)]
+    pub tips: String,
+    /// `button-N` 形式的操作按钮，按 N 从小到大排好序。
+    ///
+    /// 字段名带数字，没法用 serde 直接映射，由 [`parse`] 从原始 JSON 里挑出来。
+    #[serde(skip)]
+    pub buttons: Vec<ActionButton>,
     /// 把源码克隆下来的命令；缺省表示不需要克隆，直接用「工作目录」。
     #[serde(rename = "clone-command", default)]
     pub clone_command: Option<String>,
@@ -206,6 +217,21 @@ impl ProjectEntry {
             .filter(|name| !name.is_empty())
     }
 
+    /// 适用平台（去掉空白项）。
+    pub fn platforms(&self) -> Vec<&str> {
+        self.platform
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
+    /// 额外提示（去掉首尾空白后非空才算）。
+    pub fn tips(&self) -> Option<&str> {
+        let tips = self.tips.trim();
+        if tips.is_empty() { None } else { Some(tips) }
+    }
+
     /// 项目相关的外部链接：`(显示名, URL)`。
     ///
     /// 顺序固定，方便界面按统一顺序渲染。
@@ -219,6 +245,50 @@ impl ProjectEntry {
         }
         out
     }
+}
+
+/// 从条目的原始 JSON 里挑出 `button-<数字>` 形式的按钮，按数字从小到大排序。
+///
+/// 数字位数不限：`button-1`、`button-07`、`button-123` 都认。
+fn extract_buttons(value: &serde_json::Value, warnings: &mut Vec<String>) -> Vec<ActionButton> {
+    let Some(map) = value.as_object() else {
+        return Vec::new();
+    };
+
+    let mut found: Vec<(String, ActionButton)> = Vec::new();
+    for (key, raw) in map {
+        let Some(number) = button_number(key) else {
+            continue;
+        };
+        match serde_json::from_value::<ActionButton>(raw.clone()) {
+            Ok(button) => {
+                if button.commands.is_empty() {
+                    warnings.push(format!("`{key}` 没有任何命令，点了不会有反应"));
+                }
+                found.push((number, button));
+            }
+            Err(err) => warnings.push(format!("`{key}` 结构不对：{err}")),
+        }
+    }
+
+    // 按数值大小排（先比位数再比字典序，多少位都不会溢出）
+    found.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+    found.into_iter().map(|(_, button)| button).collect()
+}
+
+/// `button-` 后面跟任意位数、任意大小的数字都算按钮，返回规范化后的数字串。
+fn button_number(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("button-")?;
+    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    // 去掉前导零（`button-07` 就是第 7 个）
+    let normalized = rest.trim_start_matches('0');
+    Some(if normalized.is_empty() {
+        "0".to_string()
+    } else {
+        normalized.to_string()
+    })
 }
 
 /// 去掉首尾空白，空串按 `None` 处理。
@@ -245,18 +315,29 @@ pub fn parse(text: &str) -> Result<LoadedList, String> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("JSON 语法错误：{e}"))?;
 
-    let entries = match value {
-        serde_json::Value::Object(_) => {
-            let list: ProjectList =
-                serde_json::from_value(value).map_err(|e| format!("结构不匹配：{e}"))?;
-            list.lists
-        }
-        serde_json::Value::Array(_) => serde_json::from_value::<Vec<ProjectEntry>>(value)
-            .map_err(|e| format!("结构不匹配：{e}"))?,
+    // 先取出「原始条目数组」：button-N 这种带数字的字段名没法直接用 serde
+    // 映射，所以要在反序列化之前从原始 JSON 里挑出来。
+    let raw_list: Vec<serde_json::Value> = match value {
+        serde_json::Value::Object(map) => map
+            .get("lists")
+            .ok_or_else(|| "结构不匹配：顶层对象里缺少 `lists` 字段".to_string())?
+            .as_array()
+            .ok_or_else(|| "结构不匹配：`lists` 必须是数组".to_string())?
+            .clone(),
+        serde_json::Value::Array(items) => items,
         _ => return Err("顶层必须是对象 {\"lists\": [...]} 或数组 [...]".to_string()),
     };
 
     let mut warnings = Vec::new();
+    let mut entries = Vec::with_capacity(raw_list.len());
+    for (index, raw) in raw_list.into_iter().enumerate() {
+        let buttons = extract_buttons(&raw, &mut warnings);
+        let mut entry: ProjectEntry = serde_json::from_value(raw)
+            .map_err(|e| format!("第 {} 个条目结构不匹配：{e}", index + 1))?;
+        entry.buttons = buttons;
+        entries.push(entry);
+    }
+
     let mut seen: HashSet<&str> = HashSet::new();
     for entry in &entries {
         if entry.id.trim().is_empty() {
@@ -281,6 +362,31 @@ pub fn parse(text: &str) -> Result<LoadedList, String> {
 // ---------------------------------------------------------------------------
 // 卸载计划
 // ---------------------------------------------------------------------------
+
+/// 条目里的一个操作按钮（JSON 里写成 `button-1`、`button-2` …）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionButton {
+    /// 按钮上显示的文字。
+    #[serde(default)]
+    pub name: String,
+    /// 鼠标悬停时的说明。
+    #[serde(default)]
+    pub describe: String,
+    /// 点击后依次执行的命令。
+    #[serde(default)]
+    pub commands: Vec<CommandSpec>,
+    /// 是否放到后台跑：不占用任务位、不阻塞界面，只在开始/结束时提示一句。
+    #[serde(default)]
+    pub background: bool,
+}
+
+impl ActionButton {
+    /// 按钮文字；没写 name 时退回一个默认值。
+    pub fn label(&self) -> &str {
+        let name = self.name.trim();
+        if name.is_empty() { "执行" } else { name }
+    }
+}
 
 /// 卸载计划：直接采用作者在 `uninstall-commands` 里写的命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,6 +533,108 @@ mod tests {
             entry.links(),
             vec![("🔗", "https://g.com/x"), ("📺", "https://b.com/v")]
         );
+    }
+
+    #[test]
+    fn buttons_are_collected_and_sorted_by_number() {
+        let loaded = parse(
+            r#"{"lists":[{
+                "id": "a",
+                "github-url": "https://example.com",
+                "install-commands": ["true"],
+                "button-10": {"name": "十", "commands": ["true"]},
+                "button-2":  {"name": "二", "commands": ["true"]},
+                "button-1":  {"name": "一", "describe": "第一个", "commands": ["echo hi"]}
+            }]}"#,
+        )
+        .unwrap();
+        let entry = &loaded.entries[0];
+        let names: Vec<&str> = entry.buttons.iter().map(|b| b.label()).collect();
+        assert_eq!(names, vec!["一", "二", "十"], "要按数字排，不是按字符串");
+        assert_eq!(entry.buttons[0].describe, "第一个");
+        assert_eq!(entry.buttons[0].commands[0].command(), "echo hi");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
+    /// button- 后面跟任意数字都认；不规范的键名一律忽略。
+    #[test]
+    fn any_number_of_digits_is_recognised() {
+        let loaded = parse(
+            r#"{"lists":[{
+                "id": "a",
+                "button-1": {"name": "一", "commands": ["true"]},
+                "button-007": {"name": "七", "commands": ["true"]},
+                "button-0": {"name": "零", "commands": ["true"]},
+                "button-123456789012345678901234567890": {"name": "巨", "commands": ["true"]},
+                "button-": {"name": "空数字", "commands": ["true"]},
+                "button-x": {"name": "非数字", "commands": ["true"]},
+                "button": {"name": "没有横杠", "commands": ["true"]},
+                "buttons-1": {"name": "复数", "commands": ["true"]},
+                "button-1x": {"name": "数字加字母", "commands": ["true"]}
+            }]}"#,
+        )
+        .unwrap();
+        let names: Vec<&str> = loaded.entries[0].buttons.iter().map(|b| b.label()).collect();
+        assert_eq!(
+            names,
+            vec!["零", "一", "七", "巨"],
+            "只有 button-<纯数字> 才算按钮，且按数值排序"
+        );
+    }
+
+    #[test]
+    fn buttons_without_commands_are_warned_about() {
+        let loaded = parse(
+            r#"{"lists":[{"id": "a", "button-1": {"name": "空"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(loaded.entries[0].buttons.len(), 1, "按钮本身还是要留着");
+        assert!(
+            loaded.warnings.iter().any(|w| w.contains("button-1")),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+
+    #[test]
+    fn buttons_can_ask_to_run_in_the_background() {
+        let loaded = parse(
+            r#"{"lists":[{"id": "a",
+                "button-1": {"name": "启动", "background": true, "commands": ["true"]},
+                "button-2": {"name": "普通", "commands": ["true"]}
+            }]}"#,
+        )
+        .unwrap();
+        let buttons = &loaded.entries[0].buttons;
+        assert!(buttons[0].background, "写了 background: true 就该是后台按钮");
+        assert!(!buttons[1].background, "没写就默认前台");
+    }
+
+    #[test]
+    fn platforms_and_tips_are_optional() {
+        let loaded = parse(
+            r#"{"lists":[{
+                "id": "a",
+                "platform": ["all-linux", "x86_64"],
+                "tips": "注意安全\n第二行"
+            }]}"#,
+        )
+        .unwrap();
+        let entry = &loaded.entries[0];
+        assert_eq!(entry.platforms(), vec!["all-linux", "x86_64"]);
+        assert_eq!(entry.tips(), Some("注意安全\n第二行"));
+
+        // 没写 / 空串 / 空白项都要当“没有”
+        let loaded = parse(r#"{"lists":[{"id": "a"}]}"#).unwrap();
+        assert!(loaded.entries[0].platforms().is_empty());
+        assert_eq!(loaded.entries[0].tips(), None);
+
+        let loaded = parse(
+            r#"{"lists":[{"id": "a", "platform": ["", "  "], "tips": "   "}]}"#,
+        )
+        .unwrap();
+        assert!(loaded.entries[0].platforms().is_empty());
+        assert_eq!(loaded.entries[0].tips(), None);
     }
 
     #[test]
