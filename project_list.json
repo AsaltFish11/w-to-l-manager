@@ -206,7 +206,18 @@
                     "permission": "normal",
                     "command": "rm -rf ~/.cache/activate-linux"
                 }
-            ]
+            ],
+            "button-1": {
+                "name": "运行",
+                "describe": "打开激活窗口",
+                "background": true,
+                "commands": [
+                    {
+                        "permission": "normal",
+                        "command": "activate"
+                    }
+                ]
+            }
         }
     ]
 }

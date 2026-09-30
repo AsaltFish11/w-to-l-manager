@@ -5,6 +5,7 @@
 并支持一键**克隆源码 → 安装 / 卸载**。安装卸载的输出显示在界面下方的日志面板里，
 同时打印到命令行。
 注意: 本项目完全使用AI开发, 且不会长期稳定
+子项目 https://github.com/AsaltFish11/w-to-l-manager-config ，存放了最新的`project_list.json`
 
 ## 快速开始
 
