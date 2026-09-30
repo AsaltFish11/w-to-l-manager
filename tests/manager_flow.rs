@@ -456,6 +456,61 @@ fn author_provided_uninstall_commands_take_priority() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// 卸载命令容忍非 0，但“sudo 密码不对”绝不能被当成正常情况忽略。
+#[test]
+fn a_wrong_sudo_password_is_never_ignored_even_for_optional_steps() {
+    if paths::which("sudo").is_none() {
+        eprintln!("跳过：系统里没有 sudo");
+        return;
+    }
+    // SAFETY: geteuid 无参数、无副作用。
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("跳过：当前是 root");
+        return;
+    }
+
+    let dir = temp_dir("sudo-optional");
+    let console = Console::new(false);
+    let job = Job::spawn(JobRequest {
+        project_id: "sudo-optional".to_string(),
+        kind: JobKind::Uninstall,
+        steps: vec![
+            // 用 root 命令模拟卸载时需要提权的那一步
+            JobStep::root("rm -f /nonexistent/w2l-should-not-matter").optional(),
+            JobStep::user("echo 后面这步不该执行 > after.txt"),
+        ],
+        work_dir: dir.clone(),
+        sudo_password: Some("definitely-not-the-right-password".to_string()),
+        source_base: None,
+        env: Vec::new(),
+        console: console.clone(),
+    });
+
+    let outcome = wait_for_outcome(&job, Duration::from_secs(30));
+    match outcome {
+        JobOutcome::Failed => {
+            let message = job.lock().message.clone();
+            assert!(
+                message.contains("认证") || message.contains("sudo"),
+                "失败原因应该说明是认证问题：{message}"
+            );
+            assert_eq!(
+                job.lock().ignored_failures,
+                0,
+                "认证失败不该被算作“已忽略”"
+            );
+        }
+        // 这台机器上 sudo 不需要密码时会成功，那就只要求没被忽略
+        JobOutcome::Succeeded => {
+            assert_eq!(job.lock().ignored_failures, 0);
+            eprintln!("注意：这台机器上的 sudo 不需要密码");
+        }
+        other => panic!("不应出现 {other:?}"),
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_failing_command_stops_the_install_and_is_reported() {
     let dir = temp_dir("failure");
@@ -727,6 +782,102 @@ fn update_keeps_unrelated_files_in_the_tmp_dir() {
     assert!(
         steps::tmp_dir(&root).join("keep-me.txt").is_file(),
         "tmp 里别人的文件不该被动"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// 没标 `ignore-error` 的卸载命令：返回非 0 就中止，后面的不执行。
+#[test]
+fn an_unmarked_failing_uninstall_command_aborts() {
+    let root = temp_dir("uninstall-strict");
+    fs::create_dir_all(&root).unwrap();
+
+    let entry = ProjectEntry {
+        id: "demo".to_string(),
+        uninstall_commands: vec![
+            CommandSpec::normal("false"),
+            CommandSpec::normal("echo should-not-run > marker.txt"),
+        ],
+        ..Default::default()
+    };
+    let plan = steps::uninstall_steps(
+        &root,
+        &entry,
+        &entry.uninstall_commands,
+        &[],
+        None,
+        false,
+    );
+
+    let console = Console::new(false);
+    let job = Job::spawn(JobRequest {
+        project_id: "demo".to_string(),
+        kind: JobKind::Uninstall,
+        steps: plan.steps,
+        work_dir: root.clone(),
+        sudo_password: None,
+        source_base: plan.source_base,
+        env: Vec::new(),
+        console: console.clone(),
+    });
+
+    assert_eq!(
+        wait_for_outcome(&job, Duration::from_secs(20)),
+        JobOutcome::Failed,
+        "没标记的命令失败就该判失败"
+    );
+    assert!(
+        !root.join("marker.txt").exists(),
+        "失败之后不该继续执行后面的命令"
+    );
+    assert_eq!(job.lock().ignored_failures, 0);
+    assert!(console_text(&console).contains("任务失败"), "{}", console_text(&console));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// 标了 `ignore-error` 的命令：返回非 0 也继续，整体仍算成功。
+#[test]
+fn an_ignore_error_command_keeps_going() {
+    let root = temp_dir("uninstall-tolerant");
+    fs::create_dir_all(&root).unwrap();
+
+    let entry = ProjectEntry {
+        id: "demo".to_string(),
+        uninstall_commands: vec![
+            // 模拟“没东西可卸”——比如装在别的 PREFIX、或者已经手动删过了
+            CommandSpec::normal("false").ignoring_error(),
+            CommandSpec::normal("echo still-ran > marker.txt"),
+        ],
+        ..Default::default()
+    };
+
+    let plan = steps::uninstall_steps(
+        &root,
+        &entry,
+        &entry.uninstall_commands,
+        &[],
+        None,
+        false,
+    );
+    let (job, console) = run_plan("demo", JobKind::Uninstall, plan, &root);
+
+    assert!(
+        root.join("marker.txt").is_file(),
+        "标了 ignore-error 就该继续执行后面的命令"
+    );
+    assert_eq!(job.lock().ignored_failures, 1, "应记下 1 条被忽略的失败");
+
+    let text = console_text(&console);
+    assert!(text.contains("返回非 0"), "日志要说清是返回非 0：\n{text}");
+    assert!(
+        text.contains("已忽略"),
+        "结尾应说明被忽略了，而不是报失败：\n{text}"
+    );
+    assert!(
+        !text.contains("任务失败"),
+        "整体不该被判定为失败：\n{text}"
     );
 
     let _ = fs::remove_dir_all(&root);

@@ -4,6 +4,7 @@
             "id": "cmd",
             "author": "ChenPi11",
             "describe": "Windows cmd.exe 命令解释器在 Unix 上的忠实重实现。\n诞生于 GNU/Linux，可在所有的类 Unix 系统上运行。\n很遗憾，它不支持 Windows 平台，无法占领 Windows 市场。",
+            "license": "GPL-3.0-or-later",
             "github-url": "https://github.com/ChenPi11/cmd",
             "bilibili-url": "https://www.bilibili.com/video/BV1wkuH64EE8",
             "platform": [
@@ -46,6 +47,7 @@
             "id": "Explorer-for-Linux",
             "author": "macOS-Terminal",
             "describe": "在 Linux 上深度复刻 Windows 11 资源管理器的极客项目，还原其经典的“未响应”体验。\n注意：本项目包含崩溃接管与强制退出功能。默认配置不会破坏任何东西，但打开 EXPLORER_SESSION_KILL=1 后它会真的终止你的用户会话。只装在你自己的机器上， 装之前备份配置，并背下 Shift+F10。",
+            "license": "MIT",
             "github-url": "https://github.com/macOS-Terminal/Explorer-for-Linux",
             "bilibili-url": "https://www.bilibili.com/video/BV1ZWgV68EtU",
             "platform": [
@@ -112,6 +114,7 @@
             "id": "activate-linux",
             "author": "MrGlockenspiel",
             "describe": "将激活Windows水印移植到linux的一个项目",
+            "license": "GPL-3.0-only",
             "github-url": "https://github.com/MrGlockenspiel/activate-linux",
             "platform": [
                 "all-linux"
@@ -134,7 +137,8 @@
             "uninstall-commands": [
                 {
                     "permission": "root",
-                    "command": "make uninstall"
+                    "command": "make uninstall",
+                    "ignore-error": true
                 }
             ],
             "button-1": {
@@ -158,6 +162,51 @@
                     }
                 ]
             }
+        },
+        {
+            "id": "Linux-Activator",
+            "author": "jihan-hanhan",
+            "describe": "一个由配置驱动的 Linux 桌面激活套件。作为一个独立的恶搞/教育项目，它复刻了 Windows 的激活工作流——包括产品密钥对话框、激活状态和水印集成。",
+            "license": "MIT",
+            "github-url": "https://github.com/jihan-hanhan/Linux-Activator",
+            "bilibili-url": "https://www.bilibili.com/video/BV1cj8c6jE7f",
+            "platform": [
+                "all-linux"
+            ],
+            "clone-command": "git clone --depth=1 https://github.com/jihan-hanhan/Linux-Activator.git",
+            "dependency": [
+                "cmake",
+                "gcc"
+            ],
+            "install-commands": [
+                {
+                    "permission": "normal",
+                    "command": "chmod +x install.sh"
+                },
+                {
+                    "permission": "root",
+                    "command": "./install.sh"
+                }
+            ],
+            "uninstall-commands": [
+                {
+                    "permission": "normal",
+                    "command": "systemctl --user disable --now activate-linux.service",
+                    "ignore-error": true
+                },
+                {
+                    "permission": "normal",
+                    "command": "rm -f ~/.config/autostart/activate-linux.desktop ~/.config/systemd/user/activate-linux.service ~/activate.kdl"
+                },
+                {
+                    "permission": "root",
+                    "command": "rm -f /usr/local/bin/activate /usr/local/bin/activate-daemon"
+                },
+                {
+                    "permission": "normal",
+                    "command": "rm -rf ~/.cache/activate-linux"
+                }
+            ]
         }
     ]
 }

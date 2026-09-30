@@ -29,6 +29,8 @@ const MUTED: Color32 = Color32::from_rgb(0x8c, 0x8c, 0x8c);
 const PLATFORM_BG: Color32 = Color32::from_rgb(0x2c, 0x3a, 0x48);
 /// 提示框的底色。
 const TIPS_BG: Color32 = Color32::from_rgb(0x33, 0x2c, 0x1e);
+/// 许可证标签的底色。
+const LICENSE_BG: Color32 = Color32::from_rgb(0x35, 0x35, 0x3c);
 
 /// 自动重载检查文件变化的间隔。
 const AUTO_RELOAD_INTERVAL: Duration = Duration::from_millis(800);
@@ -1344,6 +1346,7 @@ impl ManagerApp {
         let describe = entry.describe.clone();
         let author = entry.author().map(str::to_string);
         let platforms: Vec<String> = entry.platforms().iter().map(|p| p.to_string()).collect();
+        let license = entry.license().map(str::to_string);
         let tips = entry.tips().map(str::to_string);
         let buttons: Vec<(String, String)> = entry
             .buttons
@@ -1439,6 +1442,15 @@ impl ManagerApp {
                                 .background_color(PLATFORM_BG),
                         )
                         .on_hover_text("适用平台");
+                    }
+                    if let Some(license) = &license {
+                        ui.label(
+                            RichText::new(license)
+                                .color(MUTED)
+                                .small()
+                                .background_color(LICENSE_BG),
+                        )
+                        .on_hover_text("许可证（SPDX 标识）");
                     }
                     if installed {
                         let text = if installed_at > 0 {
@@ -1788,11 +1800,15 @@ impl ManagerApp {
                         ui.label(RichText::new(&guard.message).color(ERR_RED));
                     }
                     ui.horizontal_wrapped(|ui| {
+                        let overall_ok = guard.outcome == JobOutcome::Succeeded;
                         for (i, status) in guard.step_status.iter().enumerate() {
                             let color = match status {
                                 StepStatus::Pending => MUTED,
                                 StepStatus::Running => INFO_BLUE,
                                 StepStatus::Ok => OK_GREEN,
+                                // 任务整体成功却有待失败步骤 => 那一步是被忽略的
+                                // （卸载时命令返回非 0 很常见），别标成刺眼的红色
+                                StepStatus::Failed if overall_ok => WARN_AMBER,
                                 StepStatus::Failed => ERR_RED,
                             };
                             let text = format!("{} 第 {} 步", status.symbol(), i + 1);
@@ -2516,6 +2532,28 @@ impl ManagerApp {
                 RichText::new("这些卸载命令来自 project_list.json 的 uninstall-commands。")
                     .color(MUTED),
             );
+            ui.add_space(2.0);
+            let tolerated = commands.iter().filter(|c| c.ignore_error()).count();
+            if tolerated > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "其中 {tolerated} 条标了「忽略错误」：返回非 0 也会继续执行后面的命令；\
+                         其余命令一旦失败就中止卸载。",
+                    ))
+                    .color(INFO_BLUE)
+                    .small(),
+                );
+            } else {
+                ui.label(
+                    RichText::new(
+                        "任何一条命令返回非 0 都会中止卸载。装在不同层次（用户级 / 系统级、\
+                         不同 PREFIX）时“没东西可卸”是正常的，可以在 JSON 里给那条命令加 \
+                         \"ignore-error\": true。",
+                    )
+                    .color(MUTED)
+                    .small(),
+                );
+            }
 
             ui.add_space(6.0);
             ui.label(RichText::new("将要依次执行：").strong());
@@ -2837,6 +2875,9 @@ impl ManagerApp {
                 ui.label(
                     RichText::new("• platform：适用平台数组，如 [\"all-linux\"]，显示成小标签").strong(),
                 );
+                ui.label(
+                    RichText::new("• license：许可证标识（SPDX 写法，如 MIT），显示成小标签").strong(),
+                );
                 ui.label(RichText::new("• tips：额外提示（可多行），显示成醒目的提示框").strong());
                 ui.label(RichText::new("• clone-command：把源码克隆下来的命令").strong());
                 ui.label(
@@ -2858,7 +2899,11 @@ impl ManagerApp {
                     .color(INFO_BLUE),
                 );
                 ui.add_space(6.0);
-                ui.label("命令的两种写法（permission 缺省为 normal）：");
+                ui.label(
+                    "命令的两种写法（permission 缺省为 normal）：直接写字符串，\
+                     或写对象 —— 对象里可以加 `\"ignore-error\": true`，\
+                     表示这条命令返回非 0 也继续往下跑；没标的命令一旦返回非 0 就中止。",
+                );
                 ui.add(
                     egui::TextEdit::multiline(&mut self.help_sample)
                         .code_editor()
@@ -2940,6 +2985,7 @@ const HELP_SAMPLE: &str = r#"{
             "github-url": "https://github.com/ChenPi11/cmd",
             "bilibili-url": "https://www.bilibili.com/video/BV1wkuH64EE8",
             "platform": ["all-linux"],
+            "license": "GPL-3.0-or-later",
             "tips": "作者留的额外说明，会显示成提示框",
             "clone-command": "git clone --depth=1 https://github.com/ChenPi11/cmd.git",
             "dependency": ["make"],
@@ -2948,7 +2994,11 @@ const HELP_SAMPLE: &str = r#"{
                 { "permission": "normal", "command": "make install PREFIX=/usr/local" }
             ],
             "uninstall-commands": [
-                { "permission": "root", "command": "rm -f /usr/local/bin/cmd" }
+                { "permission": "root", "command": "rm -f /usr/local/bin/cmd" },
+                {
+                    "command": "make uninstall",
+                    "ignore-error": true
+                }
             ],
             "button-1": {
                 "name": "运行",
@@ -3026,6 +3076,10 @@ fn permission_line(ui: &mut Ui, index: usize, spec: &CommandSpec) {
         ui.monospace(format!("  {index}. {}", spec.command()));
         if needs_root {
             ui.label(RichText::new("root").color(WARN_AMBER).small());
+        }
+        if spec.ignore_error() {
+            ui.label(RichText::new("忽略错误").color(INFO_BLUE).small())
+                .on_hover_text("这条命令返回非 0 时继续执行后面的命令");
         }
     });
 }
@@ -3431,6 +3485,48 @@ mod tests {
                 assert!(!*background, "停止按钮仍是前台执行")
             }
             _ => panic!("应该弹出确认框"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const ENTRY_WITH_IGNORE_ERROR: &str = r#"{
+        "lists": [
+            {
+                "id": "ignore-demo",
+                "github-url": "https://github.com/example/demo",
+                "install-commands": [ { "permission": "normal", "command": "make" } ],
+                "uninstall-commands": [
+                    { "permission": "normal", "command": "make uninstall" },
+                    {
+                        "permission": "root",
+                        "command": "explorer-killall --session",
+                        "ignore-error": true
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    /// ignore-error 要一路传到卸载确认框（框里会据此标出「忽略错误」）。
+    #[test]
+    fn uninstall_dialog_receives_ignore_error_flags() {
+        let (mut app, dir) = setup("ignore-error-dialog", ENTRY_WITH_IGNORE_ERROR);
+        let entry = app.entries[0].clone();
+        app.state.installed.insert(
+            entry.id.clone(),
+            crate::state::InstallRecord::default(),
+        );
+
+        app.begin_uninstall(&entry);
+
+        match app.dialog.as_ref() {
+            Some(Dialog::ConfirmUninstall { commands, .. }) => {
+                assert_eq!(commands.len(), 2);
+                assert!(!commands[0].ignore_error(), "没标的那条仍然失败即停");
+                assert!(commands[1].ignore_error(), "标了的那条要能被认出来");
+            }
+            _ => panic!("应该弹出卸载确认框"),
         }
 
         let _ = fs::remove_dir_all(&dir);

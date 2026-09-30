@@ -64,6 +64,17 @@ pub struct DetailedCommand {
     #[serde(default)]
     pub permission: Permission,
     pub command: String,
+    /// 特殊配置：这条命令返回非 0 也继续往下跑（其余命令非 0 就中止）。
+    ///
+    /// 主要给卸载用：同一个项目可能装在用户级或系统级，`make uninstall`、
+    /// `systemctl --user disable` 这类命令“没东西可卸”时返回非 0 是正常的。
+    #[serde(
+        rename = "ignore-error",
+        alias = "continue-on-error",
+        alias = "allow-failure",
+        default
+    )]
+    pub ignore_error: bool,
 }
 
 /// 一条命令：支持字符串简写与带权限的完整写法。
@@ -80,7 +91,31 @@ impl CommandSpec {
         CommandSpec::Detailed(DetailedCommand {
             permission,
             command: command.into(),
+            ignore_error: false,
         })
+    }
+
+    /// 这条命令失败（返回非 0）时是否继续执行后面的命令。
+    pub fn ignore_error(&self) -> bool {
+        match self {
+            CommandSpec::Plain(_) => false,
+            CommandSpec::Detailed(detail) => detail.ignore_error,
+        }
+    }
+
+    /// 标记成「返回非 0 也继续」。
+    pub fn ignoring_error(self) -> Self {
+        match self {
+            CommandSpec::Plain(command) => CommandSpec::Detailed(DetailedCommand {
+                permission: Permission::Normal,
+                command,
+                ignore_error: true,
+            }),
+            CommandSpec::Detailed(mut detail) => {
+                detail.ignore_error = true;
+                CommandSpec::Detailed(detail)
+            }
+        }
     }
 
     /// 普通权限的简写命令。
@@ -102,9 +137,13 @@ impl CommandSpec {
         }
     }
 
-    /// 换一条命令，保留原有权限。
+    /// 换一条命令，保留原有权限与「忽略错误」设置。
     pub fn with_command(&self, command: impl Into<String>) -> Self {
-        CommandSpec::new(command, self.permission())
+        let mut spec = CommandSpec::new(command, self.permission());
+        if self.ignore_error() {
+            spec = spec.ignoring_error();
+        }
+        spec
     }
 }
 
@@ -126,7 +165,8 @@ impl<'de> Deserialize<'de> for CommandSpec {
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(
-                    "命令字符串，或 {\"permission\": \"normal\"|\"root\", \"command\": \"...\"}",
+                    "命令字符串，或 {\"permission\": \"normal\"|\"root\", \
+                     \"command\": \"...\", \"ignore-error\": true}",
                 )
             }
 
@@ -179,6 +219,9 @@ pub struct ProjectEntry {
     /// 适用平台，比如 `["all-linux"]`；空数组表示没写。
     #[serde(default)]
     pub platform: Vec<String>,
+    /// 许可证标识，一般是 SPDX 写法（`MIT`、`GPL-3.0-only`…）。
+    #[serde(default)]
+    pub license: Option<String>,
     /// 额外提示（可多行），显示在说明下方。
     #[serde(default)]
     pub tips: String,
@@ -224,6 +267,11 @@ impl ProjectEntry {
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
             .collect()
+    }
+
+    /// 许可证标识（去掉首尾空白后非空才算）。
+    pub fn license(&self) -> Option<&str> {
+        non_empty(self.license.as_deref())
     }
 
     /// 额外提示（去掉首尾空白后非空才算）。
@@ -611,6 +659,18 @@ mod tests {
     }
 
     #[test]
+    fn license_is_optional_and_trimmed() {
+        let loaded = parse(r#"{"lists":[{"id": "a", "license": " GPL-3.0-only "}]}"#).unwrap();
+        assert_eq!(loaded.entries[0].license(), Some("GPL-3.0-only"));
+
+        let loaded = parse(r#"{"lists":[{"id": "a", "license": "   "}]}"#).unwrap();
+        assert_eq!(loaded.entries[0].license(), None);
+
+        let loaded = parse(r#"{"lists":[{"id": "a"}]}"#).unwrap();
+        assert_eq!(loaded.entries[0].license(), None);
+    }
+
+    #[test]
     fn platforms_and_tips_are_optional() {
         let loaded = parse(
             r#"{"lists":[{
@@ -635,6 +695,25 @@ mod tests {
         .unwrap();
         assert!(loaded.entries[0].platforms().is_empty());
         assert_eq!(loaded.entries[0].tips(), None);
+    }
+
+    #[test]
+    fn ignore_error_is_read_from_json() {
+        let loaded = parse(
+            r#"{"lists":[{"id": "a", "uninstall-commands": [
+                "plain",
+                {"permission": "root", "command": "rm -f /x", "ignore-error": true},
+                {"command": "alias", "continue-on-error": true},
+                {"command": "normal", "ignore-error": false}
+            ]}]}"#,
+        )
+        .unwrap();
+        let commands = &loaded.entries[0].uninstall_commands;
+        assert!(!commands[0].ignore_error(), "默认是失败即停");
+        assert!(commands[1].ignore_error());
+        assert!(commands[1].permission().needs_root(), "权限声明不受影响");
+        assert!(commands[2].ignore_error(), "别名 continue-on-error 也要认");
+        assert!(!commands[3].ignore_error());
     }
 
     #[test]

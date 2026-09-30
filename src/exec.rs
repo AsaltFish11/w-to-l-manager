@@ -558,7 +558,9 @@ impl Worker {
         let (stream, text) = match outcome {
             JobOutcome::Succeeded if ignored > 0 => (
                 LogStream::Info,
-                format!("✔ 命令执行完成（有 {ignored} 步失败但已忽略，总耗时 {total_secs:.1} 秒）"),
+                format!(
+                    "✔ 全部命令执行完毕（其中 {ignored} 条返回非 0，已忽略；总耗时 {total_secs:.1} 秒）"
+                ),
             ),
             JobOutcome::Succeeded => (
                 LogStream::Info,
@@ -658,9 +660,12 @@ impl Worker {
             let prefix = if step.needs_root { "$ (root) " } else { "$ " };
             self.log(index, LogStream::Info, format!("{prefix}{}", step.command));
 
+            let auth_before = self.auth_failed.load(Ordering::SeqCst);
             let step_started = Instant::now();
             let code = self.exec_one(index, step, &dir, sudo_password.as_deref())?;
             let step_secs = step_started.elapsed().as_secs_f32();
+            // 这一步是不是因为 sudo 认证失败才挂的
+            let auth_from_this_step = !auth_before && self.auth_failed.load(Ordering::SeqCst);
 
             {
                 let mut guard = self.lock();
@@ -697,14 +702,26 @@ impl Worker {
                     self.steps.len(),
                     step.command
                 );
-                if step.optional {
+                // 认证失败一定要停下来：卸载命令虽然容忍非 0，
+                // 但密码不对导致的“没卸掉”和“没东西可卸”完全是两回事。
+                if step.optional && !auth_from_this_step {
                     self.lock().ignored_failures += 1;
                     self.log(
                         index,
                         LogStream::Info,
-                        format!("⚠ 第 {} 步失败（{shown}），这一步可以忽略，继续执行", index + 1),
+                        format!(
+                            "⚠ 第 {} 步返回非 0（{shown}），这一步可以忽略，继续执行后面的",
+                            index + 1
+                        ),
                     );
                     continue;
+                }
+                if auth_from_this_step {
+                    return Err(StepError::Message(format!(
+                        "第 {} 条命令因 sudo 认证失败而中止（密码不对或没有权限），\
+                         这一步不能当作“没什么可卸”忽略掉",
+                        index + 1
+                    )));
                 }
                 return Err(StepError::Message(format!(
                     "第 {} 条命令失败（{shown}）：{}",

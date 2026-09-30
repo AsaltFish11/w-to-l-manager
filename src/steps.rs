@@ -141,12 +141,15 @@ pub fn uninstall_steps(
         .needs_clone()
         .then(|| paths::project_source_base(project_root, &entry.id));
 
+    // 卸载命令默认和非 0 中止，只有条目里显式写了
+    // `"ignore-error": true` 的那几条才会“失败也继续”。
     let mut steps: Vec<JobStep> = commands
         .iter()
         .map(|spec| project_step(spec, source_base.is_some()))
         .collect();
 
-    // 包可能已经被手动删掉了，这一步失败不该让整个卸载判定为失败
+    // 这两步是管理器自己的收尾动作，不是条目里的命令：
+    // 包可能已经被手动删了、源码目录可能早就没了，失败不该让卸载判定为失败。
     if let Some(kind) = manager {
         for command in kind.remove_commands(remove_packages) {
             steps.push(JobStep::root(command).optional());
@@ -189,11 +192,15 @@ pub fn action_steps(project_root: &Path, entry: &ProjectEntry, button: &ActionBu
 
 /// 把 JSON 里的命令声明变成一步任务：权限照搬，有源码目录时在源码根目录里执行。
 fn project_step(spec: &CommandSpec, in_source: bool) -> JobStep {
-    let step = if spec.permission().needs_root() {
+    let mut step = if spec.permission().needs_root() {
         JobStep::root(spec.command())
     } else {
         JobStep::user(spec.command())
     };
+    // 条目里显式写了 `"ignore-error": true` 的命令才允许失败后继续
+    if spec.ignore_error() {
+        step = step.optional();
+    }
     if in_source {
         step.in_project_source()
     } else {
@@ -205,7 +212,7 @@ fn project_step(spec: &CommandSpec, in_source: bool) -> JobStep {
 mod tests {
     use super::*;
     use crate::exec::WorkDir;
-    use crate::model::Permission;
+    use crate::model::{Permission, ProjectEntry};
 
     fn entry(with_clone: bool) -> ProjectEntry {
         ProjectEntry {
@@ -362,6 +369,60 @@ mod tests {
                 step.command
             );
         }
+    }
+
+    /// 只有显式写了 `"ignore-error": true` 的命令才会失败后继续。
+    #[test]
+    fn only_commands_marked_ignore_error_tolerate_failures() {
+        let entry = ProjectEntry {
+            id: "demo".to_string(),
+            uninstall_commands: vec![
+                // 普通命令：非 0 就中止
+                CommandSpec::normal("make uninstall"),
+                // 特殊配置：返回非 0 也继续
+                CommandSpec::normal("explorer-killall --session").ignoring_error(),
+                CommandSpec::new("rm -f /usr/local/bin/demo", Permission::Root).ignoring_error(),
+            ],
+            ..Default::default()
+        };
+
+        let plan = uninstall_steps(
+            Path::new("/tmp/proj"),
+            &entry,
+            &entry.uninstall_commands,
+            &[],
+            None,
+            false,
+        );
+        assert_eq!(plan.steps.len(), 3);
+        assert!(!plan.steps[0].optional, "没标记的命令失败就该中止");
+        assert!(plan.steps[1].optional, "标了 ignore-error 的要继续");
+        assert!(plan.steps[2].optional);
+        assert!(plan.steps[2].needs_root, "权限声明不受影响");
+    }
+
+    /// 安装命令同样认这个开关，默认仍然是失败即停。
+    #[test]
+    fn install_commands_also_honour_ignore_error() {
+        let entry = ProjectEntry {
+            id: "demo".to_string(),
+            install_commands: vec![
+                CommandSpec::normal("make"),
+                CommandSpec::normal("make check || true").ignoring_error(),
+            ],
+            ..Default::default()
+        };
+
+        let plan = install_steps(
+            Path::new("/tmp/proj"),
+            &entry,
+            &[],
+            None,
+            CloneState::Fresh,
+        );
+        assert_eq!(plan.steps.len(), 2);
+        assert!(!plan.steps[0].optional);
+        assert!(plan.steps[1].optional);
     }
 
     #[test]
